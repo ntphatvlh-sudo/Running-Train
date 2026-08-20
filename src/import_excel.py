@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import sys
 from pathlib import Path
 from typing import Any
@@ -109,21 +108,21 @@ def create_external_activity_id(
     if run_id:
         return run_id
 
-    source = "|".join(
-        [
-            str(row.get("Date", "")),
-            str(row.get("Session Type", "")),
-            str(row.get("Distance km", "")),
-            str(row.get("Duration min", "")),
-            str(excel_row_number),
-        ]
+    activity_date = clean_date(row.get("Date"))
+    distance_km = clean_float(row.get("Distance km"))
+
+    if activity_date is None or distance_km is None:
+        raise ValueError(
+            f"Không thể tự tạo Run ID cho dòng Excel "
+            f"{excel_row_number}: thiếu Date hoặc Distance km"
+        )
+
+    distance_m = int(round(distance_km * 1000))
+
+    return (
+        f"RUN-{activity_date:%Y%m%d}-"
+        f"{distance_m}M"
     )
-
-    digest = hashlib.sha256(
-        source.encode("utf-8")
-    ).hexdigest()[:16].upper()
-
-    return f"EXCEL-{digest}"
 
 
 def clean_yes_no(value: Any) -> bool:
@@ -712,6 +711,7 @@ def sync_run_log(
 
     inserted = 0
     updated = 0
+    external_ids_seen: set[str] = set()
 
     for excel_index, row in frame.iterrows():
         distance_km = clean_float(
@@ -746,6 +746,15 @@ def sync_run_log(
             row,
             excel_index + 5,
         )
+
+        if external_id in external_ids_seen:
+            raise ValueError(
+                "Run Log tạo ra Run ID trùng: "
+                f"{external_id}. Nếu có hai buổi chạy cùng ngày "
+                "và cùng cự ly, hãy điền Run ID riêng cho chúng."
+            )
+
+        external_ids_seen.add(external_id)
 
         parameters = {
             "athlete_id": ATHLETE_ID,
@@ -794,6 +803,29 @@ def sync_run_log(
             updated += 1
 
     return inserted, updated
+
+
+def rebuild_rule_run_matches(connection) -> tuple[int, int]:
+    result = connection.execute(
+        text(
+            """
+            EXEC dbo.usp_RebuildRuleWorkoutMatches
+                @AthleteID = :athlete_id,
+                @PlanID = NULL,
+                @MaximumDayDifference = 1,
+                @MinimumConfidence = 0.7000
+            """
+        ),
+        {"athlete_id": ATHLETE_ID},
+    ).mappings().one_or_none()
+
+    if result is None:
+        return 0, 0
+
+    return (
+        int(result.get("RuleMatchesRemoved") or 0),
+        int(result.get("RuleMatchesCreated") or 0),
+    )
 
 
 def sync_daily_wellness(
@@ -1263,6 +1295,14 @@ def main() -> None:
             )
         )
 
+        # Xây dựng lại các RULE match để dữ liệu mới có thể sửa
+        # những match lệch ngày đã được tạo từ lần import trước.
+        # Các match MANUAL luôn được giữ nguyên.
+        (
+            rule_matches_removed,
+            rule_matches_created,
+        ) = rebuild_rule_run_matches(connection)
+
     print("Đồng bộ hoàn tất.")
 
     if calendar is not None:
@@ -1299,6 +1339,12 @@ def main() -> None:
         f"MobilitySessions: "
         f"thêm {mobility_inserted}, "
         f"cập nhật {mobility_updated}"
+    )
+
+    print(
+        f"WorkoutMatches RULE: xóa "
+        f"{rule_matches_removed}, tạo lại "
+        f"{rule_matches_created}"
     )
 
 
