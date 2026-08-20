@@ -1,0 +1,33 @@
+# Environment and credentials
+.env
+.env.*
+!.env.example
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Personal Excel data
+data/*.xlsx
+data/backups/
+data/private/
+
+# Generated outputs
+outputs/
+*.csv
+
+# Editor and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
