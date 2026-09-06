@@ -918,8 +918,8 @@ def sync_daily_wellness(
         """
         SELECT DailyWellnessID
         FROM dbo.DailyWellness
-        WHERE DailyWellnessID =:daily_wellness_id
-            AND AthleteID = :athlete_id
+        WHERE AthleteID = :athlete_id
+            AND WellnessDate = :wellness_date
         """
     )
 
@@ -990,6 +990,7 @@ def sync_daily_wellness(
             ImportedAt = SYSUTCDATETIME()
         WHERE DailyWellnessID =
             :daily_wellness_id
+            AND AthleteID = :athlete_id
         """
     )
 

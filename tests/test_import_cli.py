@@ -18,6 +18,7 @@ from import_excel import (  # noqa: E402
     ensure_athlete_exists,
     parse_args,
     positive_athlete_id,
+    sync_daily_wellness,
     sync_run_log,
     sync_strength_log,
 )
@@ -56,6 +57,9 @@ class RecordingConnection:
     ) -> FakeScalarResult:
         sql = str(statement)
         self.calls.append((sql, parameters.copy()))
+
+        if "SELECT DailyWellnessID" in sql:
+            return FakeScalarResult(303)
 
         if "SELECT ActivityID" in sql:
             return FakeScalarResult(202)
@@ -225,3 +229,42 @@ def test_sync_run_log_keeps_update_inside_athlete_scope() -> None:
         .split("WHERE", 1)[0]
     )
     assert "AthleteID" not in update_set_clause
+
+
+def test_sync_daily_wellness_uses_correct_lookup_parameters() -> None:
+    connection = RecordingConnection()
+    wellness_date = pd.Timestamp("2026-09-01").date()
+    frame = pd.DataFrame(
+        [
+            {
+                "Date": wellness_date,
+            }
+        ]
+    )
+
+    inserted, updated = sync_daily_wellness(
+        connection,
+        frame,
+        athlete_id=2,
+    )
+
+    assert (inserted, updated) == (0, 1)
+
+    find_sql, find_parameters = connection.calls[0]
+    update_sql, update_parameters = connection.calls[1]
+
+    assert "WHERE AthleteID = :athlete_id" in find_sql
+    assert "WellnessDate = :wellness_date" in find_sql
+    assert ":daily_wellness_id" not in find_sql
+    assert find_parameters == {
+        "athlete_id": 2,
+        "wellness_date": wellness_date,
+    }
+
+    assert (
+        "WHERE DailyWellnessID =" in update_sql
+    )
+    assert ":daily_wellness_id" in update_sql
+    assert "AND AthleteID = :athlete_id" in update_sql
+    assert update_parameters["daily_wellness_id"] == 303
+    assert update_parameters["athlete_id"] == 2
