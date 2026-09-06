@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import sys
+import argparse
 from pathlib import Path
 from typing import Any
 
@@ -11,11 +11,57 @@ from database import engine
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXCEL_FILE = PROJECT_ROOT / "data" / "running_data.xlsx"
+DEFAULT_EXCEL_FILE = (
+    PROJECT_ROOT / "data" / "running_data.xlsx"
+)
 
-ATHLETE_ID = 1
-DRY_RUN = "--dry-run" in sys.argv
-SYNC_CALENDAR = "--sync-calendar" in sys.argv
+def positive_athlete_id(value: str) -> int:
+    """Chuyển athlete ID từ CLI thành số nguyên dương (tối thiểu là 1)."""
+    try:
+        athlete_id = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "athlete-id phải là số nguyên dương"
+        ) from error
+
+    if athlete_id < 1:
+        raise argparse.ArgumentTypeError(
+            "athlete-id phải lớn hơn hoặc bằng 1"
+        )
+
+    return athlete_id
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Đọc và kiểm tra các tham số được truyền từ dòng lệnh."""
+    parser = argparse.ArgumentParser(
+        description="Nhập dữ liệu chạy bộ từ Excel vào SQL Server."
+    )
+
+    parser.add_argument(
+        "--athlete-id",
+        type=positive_athlete_id,
+        default=1,
+        help="ID của vận động viên; mặc định là 1.",
+    )
+    parser.add_argument(
+        "--excel-file",
+        type=Path,
+        default=DEFAULT_EXCEL_FILE,
+        help="Đường dẫn đến file Excel cần nhập.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Đọc và kiểm tra Excel nhưng không ghi vào SQL Server.",
+    )
+    parser.add_argument(
+        "--sync-calendar",
+        action="store_true",
+        help="Đồng bộ thêm Training Calendar khi nhập dữ liệu.",
+    )
+
+    return parser.parse_args(argv)
 
 
 WORKOUT_TYPE_MAP = {
@@ -140,9 +186,9 @@ def clean_yes_no(value: Any) -> bool:
     }
 
 
-def read_training_calendar() -> pd.DataFrame:
+def read_training_calendar(excel_file: Path = DEFAULT_EXCEL_FILE,) -> pd.DataFrame:
     frame = pd.read_excel(
-        EXCEL_FILE,
+        excel_file,
         sheet_name="Training Calendar",
         header=3,
         engine="openpyxl",
@@ -174,9 +220,9 @@ def read_training_calendar() -> pd.DataFrame:
     return frame
 
 
-def read_run_log() -> pd.DataFrame:
+def read_run_log(excel_file: Path = DEFAULT_EXCEL_FILE,) -> pd.DataFrame:
     frame = pd.read_excel(
-        EXCEL_FILE,
+        excel_file,
         sheet_name="Run Log",
         header=3,
         engine="openpyxl",
@@ -211,9 +257,9 @@ def read_run_log() -> pd.DataFrame:
     return frame
 
 
-def read_strength_log() -> pd.DataFrame:
+def read_strength_log(excel_file: Path = DEFAULT_EXCEL_FILE,) -> pd.DataFrame:
     frame = pd.read_excel(
-        EXCEL_FILE,
+        excel_file,
         sheet_name="Strength Log",
         header=3,
         engine="openpyxl",
@@ -276,9 +322,9 @@ def read_strength_log() -> pd.DataFrame:
     return sessions
 
 
-def read_daily_wellness() -> pd.DataFrame:
+def read_daily_wellness(excel_file: Path = DEFAULT_EXCEL_FILE,) -> pd.DataFrame:
     frame = pd.read_excel(
-        EXCEL_FILE,
+        excel_file,
         sheet_name="Daily Wellness",
         header=3,
         engine="openpyxl",
@@ -350,9 +396,9 @@ def read_daily_wellness() -> pd.DataFrame:
     return frame
 
 
-def read_mobility_log() -> pd.DataFrame:
+def read_mobility_log(excel_file: Path = DEFAULT_EXCEL_FILE,) -> pd.DataFrame:
     frame = pd.read_excel(
-        EXCEL_FILE,
+        excel_file,
         sheet_name="Mobility Log",
         header=3,
         engine="openpyxl",
@@ -389,8 +435,33 @@ def read_mobility_log() -> pd.DataFrame:
     return frame
 
 
+def ensure_athlete_exists(
+    connection,
+    athlete_id: int,
+) -> None:
+    """Dừng import nếu athlete_id không tồn tại trong SQL Server."""
+    athlete_exists = connection.execute(
+        text(
+            """
+            SELECT TOP (1) 1
+            FROM dbo.Athletes
+            WHERE AthleteID = :athlete_id
+            """
+        ),
+        {"athlete_id": athlete_id},
+    ).scalar_one_or_none()
 
-def load_plans(connection) -> list[dict]:
+    if athlete_exists is None:
+        raise ValueError(
+            f"Không tìm thấy AthleteID={athlete_id}"
+        )
+
+
+def load_plans(
+    connection,
+    athlete_id: int,
+) -> list[dict]:
+    """Tải các training plan thuộc vận động viên chỉ định"""
     rows = connection.execute(
         text(
             """
@@ -404,13 +475,13 @@ def load_plans(connection) -> list[dict]:
             ORDER BY StartDate
             """
         ),
-        {"athlete_id": ATHLETE_ID},
+        {"athlete_id": athlete_id},
     ).mappings().all()
 
     if not rows:
         raise ValueError(
             f"Không tìm thấy training plan cho "
-            f"AthleteID={ATHLETE_ID}"
+            f"AthleteID={athlete_id}"
         )
 
     return [dict(row) for row in rows]
@@ -639,13 +710,15 @@ def sync_training_calendar(
 def sync_run_log(
     connection,
     frame: pd.DataFrame,
+    athlete_id: int,
 ) -> tuple[int, int]:
     find_existing = text(
         """
         SELECT ActivityID
         FROM dbo.CompletedActivities
-        WHERE ExternalSource = 'EXCEL'
-          AND ExternalActivityID = :external_id
+        WHERE AthleteID = :athlete_id
+            AND ExternalSource = 'EXCEL'
+            AND ExternalActivityID = :external_id
         """
     )
 
@@ -692,7 +765,6 @@ def sync_run_log(
         """
         UPDATE dbo.CompletedActivities
         SET
-            AthleteID = :athlete_id,
             ActivityDate = :activity_date,
             ActivityType = 'RUN',
             DistanceM = :distance_m,
@@ -706,6 +778,7 @@ def sync_run_log(
             Notes = :notes,
             ImportedAt = SYSUTCDATETIME()
         WHERE ActivityID = :activity_id
+            AND AthleteID = :athlete_id
         """
     )
 
@@ -757,7 +830,7 @@ def sync_run_log(
         external_ids_seen.add(external_id)
 
         parameters = {
-            "athlete_id": ATHLETE_ID,
+            "athlete_id": athlete_id,
             "external_id": external_id,
             "activity_date": row["Date"],
             "distance_m": distance_m,
@@ -782,7 +855,10 @@ def sync_run_log(
 
         activity_id = connection.execute(
             find_existing,
-            {"external_id": external_id},
+            {
+                "athlete_id": athlete_id,
+                "external_id": external_id,
+            },
         ).scalar_one_or_none()
 
         if activity_id is None:
@@ -805,7 +881,11 @@ def sync_run_log(
     return inserted, updated
 
 
-def rebuild_rule_run_matches(connection) -> tuple[int, int]:
+def rebuild_rule_run_matches(
+    connection,
+    athlete_id: int,
+) -> tuple[int, int]:
+    """Xây dựng lại RULE matches cho một vận động viên."""
     result = connection.execute(
         text(
             """
@@ -816,7 +896,7 @@ def rebuild_rule_run_matches(connection) -> tuple[int, int]:
                 @MinimumConfidence = 0.7000
             """
         ),
-        {"athlete_id": ATHLETE_ID},
+        {"athlete_id": athlete_id},
     ).mappings().one_or_none()
 
     if result is None:
@@ -831,13 +911,15 @@ def rebuild_rule_run_matches(connection) -> tuple[int, int]:
 def sync_daily_wellness(
     connection,
     frame: pd.DataFrame,
+    athlete_id : int,
 ) -> tuple[int, int]:
+    """Đồng bộ Daily Wellness trong phạm vi một vận động viên."""
     find_existing = text(
         """
         SELECT DailyWellnessID
         FROM dbo.DailyWellness
         WHERE AthleteID = :athlete_id
-          AND WellnessDate = :wellness_date
+            AND WellnessDate = :wellness_date
         """
     )
 
@@ -908,6 +990,7 @@ def sync_daily_wellness(
             ImportedAt = SYSUTCDATETIME()
         WHERE DailyWellnessID =
             :daily_wellness_id
+            AND AthleteID = :athlete_id
         """
     )
 
@@ -916,7 +999,7 @@ def sync_daily_wellness(
 
     for _, row in frame.iterrows():
         parameters = {
-            "athlete_id": ATHLETE_ID,
+            "athlete_id": athlete_id,
             "wellness_date": row["Date"],
 
             "sleep_hours": clean_float(
@@ -983,7 +1066,7 @@ def sync_daily_wellness(
         existing_id = connection.execute(
             find_existing,
             {
-                "athlete_id": ATHLETE_ID,
+                "athlete_id": athlete_id,
                 "wellness_date": row["Date"],
             },
         ).scalar_one_or_none()
@@ -1013,7 +1096,9 @@ def sync_daily_wellness(
 def sync_strength_log(
     connection,
     frame: pd.DataFrame,
+    athlete_id: int,
 ) -> tuple[int, int]:
+    """Đồng bộ Strength Log trong phạm vi một vận động viên."""
     find_existing = text(
         """
         SELECT StrengthSessionID
@@ -1059,6 +1144,7 @@ def sync_strength_log(
             Completed = :completed,
             ImportedAt = SYSUTCDATETIME()
         WHERE StrengthSessionID = :session_id
+            AND AthleteID = :athlete_id
         """
     )
 
@@ -1067,7 +1153,7 @@ def sync_strength_log(
 
     for _, row in frame.iterrows():
         parameters = {
-            "athlete_id": ATHLETE_ID,
+            "athlete_id": athlete_id,
             "external_session_id": str(row["Session ID"]),
             "session_date": row["Date"],
             "planned_count": int(
@@ -1107,7 +1193,8 @@ def sync_strength_log(
 def sync_mobility_log(
     connection,
     frame: pd.DataFrame,
-) -> tuple[int, int]:
+    athlete_id: int,) -> tuple[int, int]:
+    """Đồng bộ Mobility Log trong phạm vi một vận động viên."""
     find_existing = text(
         """
         SELECT MobilitySessionID
@@ -1147,6 +1234,7 @@ def sync_mobility_log(
             Completed = :completed,
             ImportedAt = SYSUTCDATETIME()
         WHERE MobilitySessionID = :session_id
+            AND AthleteID = :athlete_id
         """
     )
 
@@ -1155,7 +1243,7 @@ def sync_mobility_log(
 
     for _, row in frame.iterrows():
         parameters = {
-            "athlete_id": ATHLETE_ID,
+            "athlete_id": athlete_id,
             "external_session_id": str(row["Session ID"]),
             "session_date": row["Date"],
             "routine": clean_text(row.get("Routine Plan")),
@@ -1185,9 +1273,11 @@ def sync_mobility_log(
 
 
 def main() -> None:
-    if not EXCEL_FILE.exists():
+    args = parse_args()
+
+    if not args.excel_file.exists():
         raise FileNotFoundError(
-            f"Không tìm thấy file Excel: {EXCEL_FILE}"
+            f"Không tìm thấy file Excel: {args.excel_file}"
         )
 
     # Mặc định không đọc Training Calendar.
@@ -1195,14 +1285,14 @@ def main() -> None:
 
     # Chỉ đọc Training Calendar khi người dùng
     # chạy script với cờ --sync-calendar.
-    if SYNC_CALENDAR:
-        calendar = read_training_calendar()
+    if args.sync_calendar:
+        calendar = read_training_calendar(args.excel_file)
 
     # Các log này luôn được đọc khi chạy import.
-    run_log = read_run_log()
-    daily_wellness = read_daily_wellness()
-    strength_log = read_strength_log()
-    mobility_log = read_mobility_log()
+    run_log = read_run_log(args.excel_file)
+    daily_wellness = read_daily_wellness(args.excel_file)
+    strength_log = read_strength_log(args.excel_file)
+    mobility_log = read_mobility_log(args.excel_file)
 
     # Hiển thị số lượng dữ liệu đã đọc.
     if calendar is not None:
@@ -1233,7 +1323,7 @@ def main() -> None:
 
     # DRY RUN chỉ kiểm tra Excel.
     # Không mở transaction ghi dữ liệu.
-    if DRY_RUN:
+    if args.dry_run:
         print(
             "DRY RUN hoàn tất. "
             "Không có dữ liệu nào được ghi vào SQL Server."
@@ -1246,10 +1336,17 @@ def main() -> None:
 
     # Mở transaction SQL Server.
     with engine.begin() as connection:
+        ensure_athlete_exists(
+            connection,
+            args.athlete_id,
+        )
 
         # Chỉ đồng bộ calendar khi có --sync-calendar.
         if calendar is not None:
-            plans = load_plans(connection)
+            plans = load_plans(
+                connection,
+                args.athlete_id,
+            )
 
             preview_plan_mapping(
                 calendar,
@@ -1269,6 +1366,7 @@ def main() -> None:
             sync_run_log(
                 connection,
                 run_log,
+                args.athlete_id,
             )
         )
         # Đồng bộ Daily wellness
@@ -1276,6 +1374,7 @@ def main() -> None:
             sync_daily_wellness(
                 connection,
                 daily_wellness,
+                args.athlete_id,
             )
         )
 
@@ -1284,6 +1383,7 @@ def main() -> None:
             sync_strength_log(
                 connection,
                 strength_log,
+                args.athlete_id,
             )
         )
 
@@ -1292,6 +1392,7 @@ def main() -> None:
             sync_mobility_log(
                 connection,
                 mobility_log,
+                args.athlete_id,
             )
         )
 
@@ -1301,7 +1402,10 @@ def main() -> None:
         (
             rule_matches_removed,
             rule_matches_created,
-        ) = rebuild_rule_run_matches(connection)
+        ) = rebuild_rule_run_matches(
+            connection,
+            args.athlete_id,
+        )
 
     print("Đồng bộ hoàn tất.")
 
