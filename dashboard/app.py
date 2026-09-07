@@ -8,6 +8,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 
 # Cho phép dashboard import src.database
@@ -17,6 +18,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.database import engine
+
+from src.auth import (
+    AthleteAccess,
+    AuthorizationError,
+    authorize_google_identity,
+    parse_google_identity,
+)
 
 
 st.set_page_config(
@@ -314,6 +322,90 @@ def show_database_error(error: Exception) -> None:
         "và thử lại bằng test_connection.py."
     )
 
+def require_authorized_access() -> list[AthleteAccess]:
+    if not st.user.is_logged_in:
+        st.title("🏃 Running Training Analytics")
+        st.info(
+            "Ứng dụng riêng tư. "
+            "Vui lòng đăng nhập bằng tài khoản Google "
+            "đã được mời."
+        )
+        st.button(
+            "Đăng nhập bằng Google",
+            on_click=st.login,
+            type="primary",
+        )
+        st.stop()
+
+    try:
+        identity = parse_google_identity(
+            st.user.to_dict()
+        )
+
+        with engine.begin() as connection:
+            return authorize_google_identity(
+                connection,
+                identity,
+            )
+    except (ValueError, AuthorizationError):
+        st.error(
+            "Google không cung cấp danh tính hợp lệ "
+            "hoặc quyền vận động viên không hợp lệ."
+        )
+    except SQLAlchemyError:
+        st.error(
+            "Tài khoản Google này chưa được mời, "
+            "đã bị khóa hoặc chưa có quyền truy cập."
+        )
+
+    st.button(
+        "Đăng xuất",
+        on_click=st.logout,
+        key="authorization_logout",
+    )
+    st.stop()
+
+
+authorized_accesses = require_authorized_access()
+
+access_by_athlete_id = {
+    access.athlete_id: access
+    for access in authorized_accesses
+}
+
+if len(access_by_athlete_id) == 1:
+    current_access = next(
+        iter(access_by_athlete_id.values())
+    )
+    st.sidebar.caption(
+        f"Vận động viên: {current_access.full_name}"
+    )
+else:
+    selected_athlete_id = st.sidebar.selectbox(
+        "Chọn vận động viên",
+        options=list(access_by_athlete_id.keys()),
+        format_func=lambda athlete_id: (
+            access_by_athlete_id[
+                athlete_id
+            ].full_name
+        ),
+    )
+    current_access = access_by_athlete_id[
+        selected_athlete_id
+    ]
+
+current_athlete_id = current_access.athlete_id
+
+st.sidebar.caption(
+    f"Vai trò: {current_access.access_role}"
+)
+
+st.sidebar.button(
+    "Đăng xuất",
+    on_click=st.logout,
+    key="sidebar_logout",
+)
+
 
 st.title("🏃 Running Training Analytics")
 
@@ -332,8 +424,12 @@ try:
             StartDate,
             EndDate
         FROM dbo.TrainingPlans
+        WHERE AthleteID = :athlete_id
         ORDER BY StartDate
-        """
+        """,
+        {
+            "athlete_id": current_athlete_id,
+        },
     )
 except Exception as error:
     show_database_error(error)
@@ -525,23 +621,30 @@ data_freshness = safe_read_query(
     (
         SELECT MAX(ImportedAt) AS ImportedAt
         FROM dbo.CompletedActivities
+        WHERE AthleteID = :athlete_id
 
         UNION ALL
 
         SELECT MAX(ImportedAt)
         FROM dbo.DailyWellness
+        WHERE AthleteID = :athlete_id
 
         UNION ALL
 
         SELECT MAX(ImportedAt)
         FROM dbo.StrengthSessions
+        WHERE AthleteID = :athlete_id
 
         UNION ALL
 
         SELECT MAX(ImportedAt)
         FROM dbo.MobilitySessions
+        WHERE AthleteID = :athlete_id
     ) AS imports
     """,
+    {
+        "athlete_id": current_athlete_id,
+    },
 )
 
 
