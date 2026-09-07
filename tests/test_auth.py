@@ -1,11 +1,52 @@
 import pytest
 
 from src.auth import (
+    AthleteAccess,
+    AuthorizationError,
     GoogleIdentity,
+    authorize_google_identity,
     normalize_email,
     parse_google_identity,
 )
 
+
+class FakeMappingResult:
+    def __init__(
+        self,
+        rows: list[dict[str, object]],
+    ) -> None:
+        self.rows = rows
+
+    def mappings(self) -> "FakeMappingResult":
+        return self
+
+    def all(self) -> list[dict[str, object]]:
+        return self.rows
+
+
+class RecordingConnection:
+    def __init__(
+        self,
+        rows: list[dict[str, object]],
+    ) -> None:
+        self.rows = rows
+        self.calls: list[
+            tuple[str, dict[str, object]]
+        ] = []
+
+    def execute(
+        self,
+        statement: object,
+        parameters: dict[str, object],
+    ) -> FakeMappingResult:
+        self.calls.append(
+            (
+                str(statement),
+                parameters.copy(),
+            )
+        )
+
+        return FakeMappingResult(self.rows)
 
 def test_parse_google_identity_normalizes_valid_claims() -> None:
     identity = parse_google_identity(
@@ -106,3 +147,135 @@ def test_normalize_email_rejects_invalid_address(
         match="Invalid Google email address",
     ):
         normalize_email(email)
+
+
+def test_authorize_google_identity_binds_parameters() -> None:
+    connection = RecordingConnection(
+        [
+            {
+                "AppUserID": 7,
+                "AthleteID": 2,
+                "FullName": "Runner Two",
+                "AccessRole": "RUNNER",
+            }
+        ]
+    )
+    identity = GoogleIdentity(
+        subject="google-subject-123",
+        email_normalized="runner@example.com",
+        display_name="Runner Two",
+    )
+
+    accesses = authorize_google_identity(
+        connection,
+        identity,
+    )
+
+    assert accesses == [
+        AthleteAccess(
+            app_user_id=7,
+            athlete_id=2,
+            full_name="Runner Two",
+            access_role="RUNNER",
+        )
+    ]
+
+    sql, parameters = connection.calls[0]
+
+    assert "dbo.usp_AuthorizeGoogleLogin" in sql
+    assert ":google_subject" in sql
+    assert ":email_normalized" in sql
+    assert ":display_name" in sql
+    assert identity.subject not in sql
+    assert identity.email_normalized not in sql
+    assert parameters == {
+        "google_subject": "google-subject-123",
+        "email_normalized": "runner@example.com",
+        "display_name": "Runner Two",
+    }
+
+
+def test_authorize_google_identity_rejects_empty_result() -> None:
+    connection = RecordingConnection([])
+    identity = GoogleIdentity(
+        subject="google-subject-123",
+        email_normalized="runner@example.com",
+        display_name=None,
+    )
+
+    with pytest.raises(
+        AuthorizationError,
+        match="No active athlete access",
+    ):
+        authorize_google_identity(connection, identity)
+
+
+@pytest.mark.parametrize(
+    ("row", "expected_message"),
+    [
+        (
+            {
+                "AppUserID": 7,
+                "AthleteID": 2,
+                "FullName": "   ",
+                "AccessRole": "RUNNER",
+            },
+            "no display name",
+        ),
+        (
+            {
+                "AppUserID": 7,
+                "AthleteID": 2,
+                "FullName": "Runner Two",
+                "AccessRole": "VIEWER",
+            },
+            "Invalid athlete access role",
+        ),
+    ],
+)
+def test_authorize_google_identity_rejects_invalid_access(
+    row: dict[str, object],
+    expected_message: str,
+) -> None:
+    connection = RecordingConnection([row])
+    identity = GoogleIdentity(
+        subject="google-subject-123",
+        email_normalized="runner@example.com",
+        display_name=None,
+    )
+
+    with pytest.raises(
+        AuthorizationError,
+        match=expected_message,
+    ):
+        authorize_google_identity(connection, identity)
+
+
+def test_authorize_google_identity_rejects_duplicate_athlete() -> None:
+    connection = RecordingConnection(
+        [
+            {
+                "AppUserID": 7,
+                "AthleteID": 2,
+                "FullName": "Runner Two",
+                "AccessRole": "RUNNER",
+            },
+            {
+                "AppUserID": 7,
+                "AthleteID": 2,
+                "FullName": "Runner Two",
+                "AccessRole": "RUNNER",
+            },
+        ]
+    )
+    identity = GoogleIdentity(
+        subject="google-subject-123",
+        email_normalized="runner@example.com",
+        display_name=None,
+    )
+
+    with pytest.raises(
+        AuthorizationError,
+        match="Duplicate athlete access",
+    ):
+        authorize_google_identity(connection, identity)
