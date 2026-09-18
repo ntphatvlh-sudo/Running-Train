@@ -1,10 +1,18 @@
+from datetime import date
+
 import pytest
 
 from src.auth import (
+    AUTHORIZED_STATE,
+    ONBOARDING_REQUIRED_STATE,
     AthleteAccess,
     AuthorizationError,
+    AuthorizationResult,
     GoogleIdentity,
+    OnboardingError,
+    RunnerOnboardingData,
     authorize_google_identity,
+    complete_runner_onboarding,
     normalize_email,
     parse_google_identity,
 )
@@ -154,6 +162,7 @@ def test_authorize_google_identity_binds_parameters() -> None:
         [
             {
                 "AppUserID": 7,
+                "AuthorizationState": "AUTHORIZED",
                 "AthleteID": 2,
                 "FullName": "Runner Two",
                 "AccessRole": "RUNNER",
@@ -166,23 +175,27 @@ def test_authorize_google_identity_binds_parameters() -> None:
         display_name="Runner Two",
     )
 
-    accesses = authorize_google_identity(
+    authorization = authorize_google_identity(
         connection,
         identity,
     )
 
-    assert accesses == [
-        AthleteAccess(
-            app_user_id=7,
-            athlete_id=2,
-            full_name="Runner Two",
-            access_role="RUNNER",
-        )
-    ]
+    assert authorization == AuthorizationResult(
+        app_user_id=7,
+        authorization_state=AUTHORIZED_STATE,
+        accesses=(
+            AthleteAccess(
+                app_user_id=7,
+                athlete_id=2,
+                full_name="Runner Two",
+                access_role="RUNNER",
+            ),
+        ),
+    )
 
     sql, parameters = connection.calls[0]
 
-    assert "dbo.usp_AuthorizeGoogleLogin" in sql
+    assert "public.authorize_google_login" in sql
     assert ":google_subject" in sql
     assert ":email_normalized" in sql
     assert ":display_name" in sql
@@ -205,10 +218,42 @@ def test_authorize_google_identity_rejects_empty_result() -> None:
 
     with pytest.raises(
         AuthorizationError,
-        match="No active athlete access",
+        match="No authorization result",
     ):
         authorize_google_identity(connection, identity)
 
+def test_authorize_google_identity_returns_onboarding() -> None:
+    connection = RecordingConnection(
+        [
+            {
+                "AppUserID": 7,
+                "AuthorizationState": (
+                    "ONBOARDING_REQUIRED"
+                ),
+                "AthleteID": None,
+                "FullName": None,
+                "AccessRole": "RUNNER",
+            }
+        ]
+    )
+    identity = GoogleIdentity(
+        subject="google-subject-123",
+        email_normalized="runner@example.com",
+        display_name="Runner Two",
+    )
+
+    authorization = authorize_google_identity(
+        connection,
+        identity,
+    )
+
+    assert authorization == AuthorizationResult(
+        app_user_id=7,
+        authorization_state=(
+            ONBOARDING_REQUIRED_STATE
+        ),
+        accesses=(),
+    )
 
 @pytest.mark.parametrize(
     ("row", "expected_message"),
@@ -216,6 +261,7 @@ def test_authorize_google_identity_rejects_empty_result() -> None:
         (
             {
                 "AppUserID": 7,
+                "AuthorizationState": "AUTHORIZED",
                 "AthleteID": 2,
                 "FullName": "   ",
                 "AccessRole": "RUNNER",
@@ -225,6 +271,7 @@ def test_authorize_google_identity_rejects_empty_result() -> None:
         (
             {
                 "AppUserID": 7,
+                "AuthorizationState": "AUTHORIZED",
                 "AthleteID": 2,
                 "FullName": "Runner Two",
                 "AccessRole": "VIEWER",
@@ -256,12 +303,14 @@ def test_authorize_google_identity_rejects_duplicate_athlete() -> None:
         [
             {
                 "AppUserID": 7,
+                "AuthorizationState": "AUTHORIZED",
                 "AthleteID": 2,
                 "FullName": "Runner Two",
                 "AccessRole": "RUNNER",
             },
             {
                 "AppUserID": 7,
+                "AuthorizationState": "AUTHORIZED",
                 "AthleteID": 2,
                 "FullName": "Runner Two",
                 "AccessRole": "RUNNER",
@@ -279,3 +328,65 @@ def test_authorize_google_identity_rejects_duplicate_athlete() -> None:
         match="Duplicate athlete access",
     ):
         authorize_google_identity(connection, identity)
+
+
+def test_complete_runner_onboarding_binds_and_returns_access() -> None:
+    achieved_date = date(2026, 9, 1)
+
+    onboarding = RunnerOnboardingData(
+        full_name="Runner Two",
+        date_of_birth=None,
+        sex=None,
+        height_cm=170.0,
+        weight_kg=65.0,
+        latest_pr_distance_m=5000,
+        latest_pr_completed_duration_sec=1500,
+        latest_pr_achieved_date=achieved_date,
+    )
+
+    connection = RecordingConnection(
+        [
+            {
+                "AppUserID": 7,
+                "AuthorizationState": "AUTHORIZED",
+                "AthleteID": 2,
+                "FullName": "Runner Two",
+                "AccessRole": "RUNNER",
+                "PersonalRecordID": 11,
+                "LatestPRDistanceM": 5000,
+                "LatestPRCompletedDurationSec": 1500,
+                "LatestPRAchievedDate": achieved_date,
+            }
+        ]
+    )
+
+    access = complete_runner_onboarding(
+        connection,
+        app_user_id=7,
+        onboarding=onboarding,
+    )
+
+    assert access == AthleteAccess(
+        app_user_id=7,
+        athlete_id=2,
+        full_name="Runner Two",
+        access_role="RUNNER",
+    )
+
+    assert len(connection.calls) == 1
+
+    statement, parameters = connection.calls[0]
+
+    assert "public.complete_runner_onboarding" in statement
+
+    assert parameters == {
+        "app_user_id": 7,
+        "full_name": "Runner Two",
+        "date_of_birth": None,
+        "sex": None,
+        "height_cm": 170.0,
+        "weight_kg": 65.0,
+        "latest_pr_distance_m": 5000,
+        "latest_pr_completed_duration_sec": 1500,
+        "latest_pr_achieved_date": achieved_date,
+    }
