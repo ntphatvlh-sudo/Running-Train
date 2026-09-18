@@ -35,7 +35,7 @@ def positive_athlete_id(value: str) -> int:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Đọc và kiểm tra các tham số được truyền từ dòng lệnh."""
     parser = argparse.ArgumentParser(
-        description="Nhập dữ liệu chạy bộ từ Excel vào SQL Server."
+        description="Nhập dữ liệu chạy bộ từ Excel vào PostgreSQL."
     )
 
     parser.add_argument(
@@ -53,7 +53,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Đọc và kiểm tra Excel nhưng không ghi vào SQL Server.",
+        help="Đọc và kiểm tra Excel nhưng không ghi vào PostgreSQL.",
     )
     parser.add_argument(
         "--sync-calendar",
@@ -322,6 +322,73 @@ def read_strength_log(excel_file: Path = DEFAULT_EXCEL_FILE,) -> pd.DataFrame:
     return sessions
 
 
+def read_strength_exercise_log(
+    excel_file: Path = DEFAULT_EXCEL_FILE,
+) -> pd.DataFrame:
+    """Đọc chi tiết từng động tác trong Strength Log."""
+    frame = pd.read_excel(
+        excel_file,
+        sheet_name="Strength Log",
+        header=3,
+        engine="openpyxl",
+    )
+
+    required_columns = {
+        "Strength ID",
+        "Date",
+        "Exercise",
+        "Category",
+        "Load kg",
+        "Sets",
+        "Reps / Duration",
+        "Volume kg",
+        "RPE 1-10",
+        "Side",
+        "Coaching Notes",
+        "Exercise Completed",
+        "Session ID",
+    }
+
+    missing = required_columns - set(frame.columns)
+
+    if missing:
+        raise ValueError(
+            "Strength Log thiếu cột chi tiết: "
+            + ", ".join(sorted(missing))
+        )
+
+    frame = frame.dropna(
+        subset=[
+            "Strength ID",
+            "Date",
+            "Exercise",
+            "Session ID",
+        ],
+        how="any",
+    ).copy()
+
+    frame["Date"] = frame["Date"].apply(clean_date)
+    frame["ExerciseCompletedBool"] = (
+        frame["Exercise Completed"].apply(clean_yes_no)
+    )
+
+    normalized_ids = frame["Strength ID"].apply(clean_text)
+    duplicate_ids = normalized_ids[
+        normalized_ids.duplicated(keep=False)
+    ].dropna()
+
+    if not duplicate_ids.empty:
+        duplicate_list = ", ".join(
+            sorted(set(duplicate_ids.astype(str)))
+        )
+        raise ValueError(
+            "Strength Log có Strength ID trùng: "
+            f"{duplicate_list}"
+        )
+
+    return frame
+
+
 def read_daily_wellness(excel_file: Path = DEFAULT_EXCEL_FILE,) -> pd.DataFrame:
     frame = pd.read_excel(
         excel_file,
@@ -439,13 +506,14 @@ def ensure_athlete_exists(
     connection,
     athlete_id: int,
 ) -> None:
-    """Dừng import nếu athlete_id không tồn tại trong SQL Server."""
+    """Dừng import nếu athlete_id không tồn tại trong PostgreSQL."""
     athlete_exists = connection.execute(
         text(
             """
-            SELECT TOP (1) 1
-            FROM dbo.Athletes
-            WHERE AthleteID = :athlete_id
+            SELECT 1
+            FROM public.athletes
+            WHERE athlete_id = :athlete_id
+            LIMIT 1
             """
         ),
         {"athlete_id": athlete_id},
@@ -466,13 +534,13 @@ def load_plans(
         text(
             """
             SELECT
-                PlanID,
-                PlanName,
-                StartDate,
-                EndDate
-            FROM dbo.TrainingPlans
-            WHERE AthleteID = :athlete_id
-            ORDER BY StartDate
+                plan_id AS "PlanID",
+                plan_name AS "PlanName",
+                start_date AS "StartDate",
+                end_date AS "EndDate"
+            FROM public.training_plans
+            WHERE athlete_id = :athlete_id
+            ORDER BY start_date
             """
         ),
         {"athlete_id": athlete_id},
@@ -552,28 +620,28 @@ def sync_training_calendar(
 ) -> tuple[int, int]:
     find_existing = text(
         """
-        SELECT PlannedWorkoutID
-        FROM dbo.PlannedWorkouts
-        WHERE PlanID = :plan_id
-          AND ScheduledDate = :scheduled_date
-          AND WorkoutName = :workout_name
+        SELECT planned_workout_id
+        FROM public.planned_workouts
+        WHERE plan_id = :plan_id
+          AND scheduled_date = :scheduled_date
+          AND workout_name = :workout_name
         """
     )
 
     insert_statement = text(
         """
-        INSERT INTO dbo.PlannedWorkouts
+        INSERT INTO public.planned_workouts
         (
-            PlanID,
-            ScheduledDate,
-            WorkoutType,
-            WorkoutName,
-            PlannedDistanceM,
-            PlannedDurationSec,
-            TargetPaceSecPerKm,
-            PriorityWeight,
-            Status,
-            Notes
+            plan_id,
+            scheduled_date,
+            workout_type,
+            workout_name,
+            planned_distance_m,
+            planned_duration_sec,
+            target_pace_sec_per_km,
+            priority_weight,
+            status,
+            notes
         )
         VALUES
         (
@@ -593,16 +661,16 @@ def sync_training_calendar(
 
     update_statement = text(
         """
-        UPDATE dbo.PlannedWorkouts
+        UPDATE public.planned_workouts
         SET
-            WorkoutType = :workout_type,
-            PlannedDistanceM = :distance_m,
-            PlannedDurationSec = :duration_sec,
-            TargetPaceSecPerKm = :target_pace,
-            PriorityWeight = :priority_weight,
-            Status = :status,
-            Notes = :notes
-        WHERE PlannedWorkoutID = :planned_workout_id
+            workout_type = :workout_type,
+            planned_distance_m = :distance_m,
+            planned_duration_sec = :duration_sec,
+            target_pace_sec_per_km = :target_pace,
+            priority_weight = :priority_weight,
+            status = :status,
+            notes = :notes
+        WHERE planned_workout_id = :planned_workout_id
         """
     )
 
@@ -695,13 +763,13 @@ def sync_training_calendar(
 
         if existing_id is None:
             connection.execute(
-            insert_statement,
-            parameters,)
-
+                insert_statement,
+                parameters,
+            )
             inserted += 1
         else:
-        # Workout đã tồn tại trong SQL Server.
-        # Giữ nguyên phiên bản hiện tại, không ghi đè từ Excel.
+            # Workout đã tồn tại trong PostgreSQL.
+            # Giữ nguyên phiên bản hiện tại, không ghi đè từ Excel.
             continue
 
     return inserted, updated
@@ -714,32 +782,32 @@ def sync_run_log(
 ) -> tuple[int, int]:
     find_existing = text(
         """
-        SELECT ActivityID
-        FROM dbo.CompletedActivities
-        WHERE AthleteID = :athlete_id
-            AND ExternalSource = 'EXCEL'
-            AND ExternalActivityID = :external_id
+        SELECT activity_id
+        FROM public.completed_activities
+        WHERE athlete_id = :athlete_id
+            AND external_source = 'EXCEL'
+            AND external_activity_id = :external_id
         """
     )
 
     insert_statement = text(
         """
-        INSERT INTO dbo.CompletedActivities
+        INSERT INTO public.completed_activities
         (
-            AthleteID,
-            ExternalSource,
-            ExternalActivityID,
-            ActivityDate,
-            ActivityType,
-            DistanceM,
-            DurationSec,
-            MovingTimeSec,
-            AveragePaceSecPerKm,
-            AverageHeartRate,
-            MaxHeartRate,
-            ElevationGainM,
-            PerceivedEffort,
-            Notes
+            athlete_id,
+            external_source,
+            external_activity_id,
+            activity_date,
+            activity_type,
+            distance_m,
+            duration_sec,
+            moving_time_sec,
+            average_pace_sec_per_km,
+            average_heart_rate,
+            max_heart_rate,
+            elevation_gain_m,
+            perceived_effort,
+            notes
         )
         VALUES
         (
@@ -763,22 +831,22 @@ def sync_run_log(
 
     update_statement = text(
         """
-        UPDATE dbo.CompletedActivities
+        UPDATE public.completed_activities
         SET
-            ActivityDate = :activity_date,
-            ActivityType = 'RUN',
-            DistanceM = :distance_m,
-            DurationSec = :duration_sec,
-            MovingTimeSec = :duration_sec,
-            AveragePaceSecPerKm = :pace_sec_per_km,
-            AverageHeartRate = :average_hr,
-            MaxHeartRate = :max_hr,
-            ElevationGainM = :elevation_m,
-            PerceivedEffort = :rpe,
-            Notes = :notes,
-            ImportedAt = SYSUTCDATETIME()
-        WHERE ActivityID = :activity_id
-            AND AthleteID = :athlete_id
+            activity_date = :activity_date,
+            activity_type = 'RUN',
+            distance_m = :distance_m,
+            duration_sec = :duration_sec,
+            moving_time_sec = :duration_sec,
+            average_pace_sec_per_km = :pace_sec_per_km,
+            average_heart_rate = :average_hr,
+            max_heart_rate = :max_hr,
+            elevation_gain_m = :elevation_m,
+            perceived_effort = :rpe,
+            notes = :notes,
+            imported_at = CURRENT_TIMESTAMP
+        WHERE activity_id = :activity_id
+            AND athlete_id = :athlete_id
         """
     )
 
@@ -889,11 +957,16 @@ def rebuild_rule_run_matches(
     result = connection.execute(
         text(
             """
-            EXEC dbo.usp_RebuildRuleWorkoutMatches
-                @AthleteID = :athlete_id,
-                @PlanID = NULL,
-                @MaximumDayDifference = 1,
-                @MinimumConfidence = 0.7000
+            SELECT
+                rule_matches_removed AS "RuleMatchesRemoved",
+                rule_matches_created AS "RuleMatchesCreated"
+            FROM public.rebuild_rule_workout_matches
+            (
+                p_athlete_id => :athlete_id,
+                p_plan_id => NULL,
+                p_maximum_day_difference => 1,
+                p_minimum_confidence => 0.7000
+            )
             """
         ),
         {"athlete_id": athlete_id},
@@ -911,39 +984,39 @@ def rebuild_rule_run_matches(
 def sync_daily_wellness(
     connection,
     frame: pd.DataFrame,
-    athlete_id : int,
+    athlete_id: int,
 ) -> tuple[int, int]:
     """Đồng bộ Daily Wellness trong phạm vi một vận động viên."""
     find_existing = text(
         """
-        SELECT DailyWellnessID
-        FROM dbo.DailyWellness
-        WHERE AthleteID = :athlete_id
-            AND WellnessDate = :wellness_date
+        SELECT daily_wellness_id
+        FROM public.daily_wellness
+        WHERE athlete_id = :athlete_id
+            AND wellness_date = :wellness_date
         """
     )
 
     insert_statement = text(
         """
-        INSERT INTO dbo.DailyWellness
+        INSERT INTO public.daily_wellness
         (
-            AthleteID,
-            WellnessDate,
-            SleepHours,
-            SleepQuality,
-            WeightKg,
-            RestingHeartRate,
-            HRVMs,
-            FatigueScore,
-            StressScore,
-            SorenessScore,
-            EnergyScore,
-            MoodScore,
-            MotivationScore,
-            ReadinessScore,
-            ReadinessBand,
-            DataQuality,
-            Notes
+            athlete_id,
+            wellness_date,
+            sleep_hours,
+            sleep_quality,
+            weight_kg,
+            resting_heart_rate,
+            hrv_ms,
+            fatigue_score,
+            stress_score,
+            soreness_score,
+            energy_score,
+            mood_score,
+            motivation_score,
+            readiness_score,
+            readiness_band,
+            data_quality,
+            notes
         )
         VALUES
         (
@@ -970,27 +1043,27 @@ def sync_daily_wellness(
 
     update_statement = text(
         """
-        UPDATE dbo.DailyWellness
+        UPDATE public.daily_wellness
         SET
-            SleepHours = :sleep_hours,
-            SleepQuality = :sleep_quality,
-            WeightKg = :weight_kg,
-            RestingHeartRate = :resting_hr,
-            HRVMs = :hrv_ms,
-            FatigueScore = :fatigue,
-            StressScore = :stress,
-            SorenessScore = :soreness,
-            EnergyScore = :energy,
-            MoodScore = :mood,
-            MotivationScore = :motivation,
-            ReadinessScore = :readiness_score,
-            ReadinessBand = :readiness_band,
-            DataQuality = :data_quality,
-            Notes = :notes,
-            ImportedAt = SYSUTCDATETIME()
-        WHERE DailyWellnessID =
+            sleep_hours = :sleep_hours,
+            sleep_quality = :sleep_quality,
+            weight_kg = :weight_kg,
+            resting_heart_rate = :resting_hr,
+            hrv_ms = :hrv_ms,
+            fatigue_score = :fatigue,
+            stress_score = :stress,
+            soreness_score = :soreness,
+            energy_score = :energy,
+            mood_score = :mood,
+            motivation_score = :motivation,
+            readiness_score = :readiness_score,
+            readiness_band = :readiness_band,
+            data_quality = :data_quality,
+            notes = :notes,
+            imported_at = CURRENT_TIMESTAMP
+        WHERE daily_wellness_id =
             :daily_wellness_id
-            AND AthleteID = :athlete_id
+            AND athlete_id = :athlete_id
         """
     )
 
@@ -1101,24 +1174,24 @@ def sync_strength_log(
     """Đồng bộ Strength Log trong phạm vi một vận động viên."""
     find_existing = text(
         """
-        SELECT StrengthSessionID
-        FROM dbo.StrengthSessions
-        WHERE AthleteID = :athlete_id
-          AND ExternalSessionID = :external_session_id
+        SELECT strength_session_id
+        FROM public.strength_sessions
+        WHERE athlete_id = :athlete_id
+          AND external_session_id = :external_session_id
         """
     )
 
     insert_statement = text(
         """
-        INSERT INTO dbo.StrengthSessions
+        INSERT INTO public.strength_sessions
         (
-            AthleteID,
-            ExternalSessionID,
-            SessionDate,
-            PlannedExerciseCount,
-            CompletedExerciseCount,
-            SessionCompletionRate,
-            Completed
+            athlete_id,
+            external_session_id,
+            session_date,
+            planned_exercise_count,
+            completed_exercise_count,
+            session_completion_rate,
+            completed
         )
         VALUES
         (
@@ -1135,16 +1208,16 @@ def sync_strength_log(
 
     update_statement = text(
         """
-        UPDATE dbo.StrengthSessions
+        UPDATE public.strength_sessions
         SET
-            SessionDate = :session_date,
-            PlannedExerciseCount = :planned_count,
-            CompletedExerciseCount = :completed_count,
-            SessionCompletionRate = :completion_rate,
-            Completed = :completed,
-            ImportedAt = SYSUTCDATETIME()
-        WHERE StrengthSessionID = :session_id
-            AND AthleteID = :athlete_id
+            session_date = :session_date,
+            planned_exercise_count = :planned_count,
+            completed_exercise_count = :completed_count,
+            session_completion_rate = :completion_rate,
+            completed = :completed,
+            imported_at = CURRENT_TIMESTAMP
+        WHERE strength_session_id = :session_id
+            AND athlete_id = :athlete_id
         """
     )
 
@@ -1190,29 +1263,185 @@ def sync_strength_log(
     return inserted, updated
 
 
-def sync_mobility_log(
+def sync_strength_exercise_log(
     connection,
     frame: pd.DataFrame,
-    athlete_id: int,) -> tuple[int, int]:
-    """Đồng bộ Mobility Log trong phạm vi một vận động viên."""
+    athlete_id: int,
+) -> tuple[int, int]:
+    """Đồng bộ từng động tác vào đúng Strength session của athlete."""
+    find_session = text(
+        """
+        SELECT strength_session_id
+        FROM public.strength_sessions
+        WHERE athlete_id = :athlete_id
+          AND external_session_id = :external_session_id
+        """
+    )
+
     find_existing = text(
         """
-        SELECT MobilitySessionID
-        FROM dbo.MobilitySessions
-        WHERE AthleteID = :athlete_id
-          AND ExternalSessionID = :external_session_id
+        SELECT strength_exercise_id
+        FROM public.strength_exercises
+        WHERE strength_session_id = :session_id
+          AND external_strength_id = :external_strength_id
         """
     )
 
     insert_statement = text(
         """
-        INSERT INTO dbo.MobilitySessions
+        INSERT INTO public.strength_exercises
         (
-            AthleteID,
-            ExternalSessionID,
-            SessionDate,
-            Routine,
-            Completed
+            strength_session_id,
+            external_strength_id,
+            exercise_name,
+            exercise_category,
+            planned_load_kg,
+            planned_sets,
+            planned_reps_or_duration,
+            planned_volume_kg,
+            planned_rpe,
+            exercise_side,
+            coaching_notes,
+            exercise_completed
+        )
+        VALUES
+        (
+            :session_id,
+            :external_strength_id,
+            :exercise_name,
+            :exercise_category,
+            :planned_load_kg,
+            :planned_sets,
+            :planned_reps_or_duration,
+            :planned_volume_kg,
+            :planned_rpe,
+            :exercise_side,
+            :coaching_notes,
+            :exercise_completed
+        )
+        """
+    )
+
+    update_statement = text(
+        """
+        UPDATE public.strength_exercises
+        SET
+            exercise_name = :exercise_name,
+            exercise_category = :exercise_category,
+            planned_load_kg = :planned_load_kg,
+            planned_sets = :planned_sets,
+            planned_reps_or_duration = :planned_reps_or_duration,
+            planned_volume_kg = :planned_volume_kg,
+            planned_rpe = :planned_rpe,
+            exercise_side = :exercise_side,
+            coaching_notes = :coaching_notes,
+            exercise_completed = :exercise_completed,
+            imported_at = CURRENT_TIMESTAMP
+        WHERE strength_exercise_id = :strength_exercise_id
+          AND strength_session_id = :session_id
+        """
+    )
+
+    inserted = 0
+    updated = 0
+
+    for _, row in frame.iterrows():
+        external_session_id = clean_text(row.get("Session ID"))
+        external_strength_id = clean_text(row.get("Strength ID"))
+        exercise_name = clean_text(row.get("Exercise"))
+
+        if not external_session_id:
+            raise ValueError("Strength exercise thiếu Session ID.")
+
+        if not external_strength_id:
+            raise ValueError("Strength exercise thiếu Strength ID.")
+
+        if not exercise_name:
+            raise ValueError("Strength exercise thiếu Exercise.")
+
+        session_parameters = {
+            "athlete_id": athlete_id,
+            "external_session_id": external_session_id,
+        }
+        session_id = connection.execute(
+            find_session,
+            session_parameters,
+        ).scalar_one_or_none()
+
+        if session_id is None:
+            raise ValueError(
+                "Không tìm thấy Strength session "
+                f"{external_session_id} cho AthleteID={athlete_id}."
+            )
+
+        parameters = {
+            "session_id": int(session_id),
+            "external_strength_id": external_strength_id,
+            "exercise_name": exercise_name,
+            "exercise_category": clean_text(row.get("Category")),
+            "planned_load_kg": clean_float(row.get("Load kg")),
+            "planned_sets": clean_int(row.get("Sets")),
+            "planned_reps_or_duration": clean_text(
+                row.get("Reps / Duration")
+            ),
+            "planned_volume_kg": clean_float(row.get("Volume kg")),
+            "planned_rpe": clean_int(row.get("RPE 1-10")),
+            "exercise_side": clean_text(row.get("Side")),
+            "coaching_notes": clean_text(row.get("Coaching Notes")),
+            "exercise_completed": bool(
+                row.get("ExerciseCompletedBool", False)
+            ),
+        }
+
+        existing_id = connection.execute(
+            find_existing,
+            {
+                "session_id": int(session_id),
+                "external_strength_id": external_strength_id,
+            },
+        ).scalar_one_or_none()
+
+        if existing_id is None:
+            connection.execute(
+                insert_statement,
+                parameters,
+            )
+            inserted += 1
+        else:
+            parameters["strength_exercise_id"] = int(existing_id)
+            connection.execute(
+                update_statement,
+                parameters,
+            )
+            updated += 1
+
+    return inserted, updated
+
+
+def sync_mobility_log(
+    connection,
+    frame: pd.DataFrame,
+    athlete_id: int,
+) -> tuple[int, int]:
+    """Đồng bộ Mobility Log trong phạm vi một vận động viên."""
+    find_existing = text(
+        """
+        SELECT mobility_session_id
+        FROM public.mobility_sessions
+        WHERE athlete_id = :athlete_id
+            AND external_session_id = :external_session_id
+        """
+    )
+
+    insert_statement = text(
+        """
+        INSERT INTO public.mobility_sessions
+        (
+            athlete_id,
+            external_session_id,
+            session_date,
+            routine,
+            completed
         )
         VALUES
         (
@@ -1227,14 +1456,14 @@ def sync_mobility_log(
 
     update_statement = text(
         """
-        UPDATE dbo.MobilitySessions
+        UPDATE public.mobility_sessions
         SET
-            SessionDate = :session_date,
-            Routine = :routine,
-            Completed = :completed,
-            ImportedAt = SYSUTCDATETIME()
-        WHERE MobilitySessionID = :session_id
-            AND AthleteID = :athlete_id
+            session_date = :session_date,
+            routine = :routine,
+            completed = :completed,
+            imported_at = CURRENT_TIMESTAMP
+        WHERE mobility_session_id = :session_id
+            AND athlete_id = :athlete_id
         """
     )
 
@@ -1292,6 +1521,9 @@ def main() -> None:
     run_log = read_run_log(args.excel_file)
     daily_wellness = read_daily_wellness(args.excel_file)
     strength_log = read_strength_log(args.excel_file)
+    strength_exercise_log = read_strength_exercise_log(
+        args.excel_file
+    )
     mobility_log = read_mobility_log(args.excel_file)
 
     # Hiển thị số lượng dữ liệu đã đọc.
@@ -1317,6 +1549,11 @@ def main() -> None:
     )
 
     print(
+        f"Strength exercises hợp lệ: "
+        f"{len(strength_exercise_log)} động tác"
+    )
+
+    print(
         f"Mobility sessions hợp lệ: "
         f"{len(mobility_log)} buổi"
     )
@@ -1326,7 +1563,7 @@ def main() -> None:
     if args.dry_run:
         print(
             "DRY RUN hoàn tất. "
-            "Không có dữ liệu nào được ghi vào SQL Server."
+            "Không có dữ liệu nào được ghi vào PostgreSQL."
         )
         return
 
@@ -1334,7 +1571,7 @@ def main() -> None:
     plan_inserted = 0
     plan_updated = 0
 
-    # Mở transaction SQL Server.
+    # Mở transaction PostgreSQL.
     with engine.begin() as connection:
         ensure_athlete_exists(
             connection,
@@ -1387,6 +1624,15 @@ def main() -> None:
             )
         )
 
+        (
+            strength_exercise_inserted,
+            strength_exercise_updated,
+        ) = sync_strength_exercise_log(
+            connection,
+            strength_exercise_log,
+            args.athlete_id,
+        )
+
         # Mobility Log luôn được đồng bộ.
         mobility_inserted, mobility_updated = (
             sync_mobility_log(
@@ -1437,6 +1683,12 @@ def main() -> None:
         f"StrengthSessions: "
         f"thêm {strength_inserted}, "
         f"cập nhật {strength_updated}"
+    )
+
+    print(
+        f"StrengthExercises: "
+        f"thêm {strength_exercise_inserted}, "
+        f"cập nhật {strength_exercise_updated}"
     )
 
     print(

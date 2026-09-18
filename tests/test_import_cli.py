@@ -18,8 +18,10 @@ from import_excel import (  # noqa: E402
     ensure_athlete_exists,
     parse_args,
     positive_athlete_id,
+    read_strength_exercise_log,
     sync_daily_wellness,
     sync_run_log,
+    sync_strength_exercise_log,
     sync_strength_log,
 )
 
@@ -58,14 +60,17 @@ class RecordingConnection:
         sql = str(statement)
         self.calls.append((sql, parameters.copy()))
 
-        if "SELECT DailyWellnessID" in sql:
+        if "SELECT daily_wellness_id" in sql:
             return FakeScalarResult(303)
 
-        if "SELECT ActivityID" in sql:
+        if "SELECT activity_id" in sql:
             return FakeScalarResult(202)
 
-        if "SELECT StrengthSessionID" in sql:
+        if "SELECT strength_session_id" in sql:
             return FakeScalarResult(101)
+
+        if "SELECT strength_exercise_id" in sql:
+            return FakeScalarResult(404)
 
         return FakeScalarResult(None)
 
@@ -125,7 +130,7 @@ def test_ensure_athlete_exists_accepts_existing_athlete() -> None:
     ensure_athlete_exists(connection, athlete_id=2)
 
     assert connection.parameters == {"athlete_id": 2}
-    assert "WHERE AthleteID = :athlete_id" in connection.statement
+    assert "WHERE athlete_id = :athlete_id" in connection.statement
 
 
 def test_ensure_athlete_exists_rejects_missing_athlete() -> None:
@@ -165,18 +170,18 @@ def test_sync_strength_log_keeps_update_inside_athlete_scope() -> None:
     find_sql, find_parameters = connection.calls[0]
     update_sql, update_parameters = connection.calls[1]
 
-    assert "WHERE AthleteID = :athlete_id" in find_sql
+    assert "WHERE athlete_id = :athlete_id" in find_sql
     assert (
-        "AND ExternalSessionID = :external_session_id"
+        "AND external_session_id = :external_session_id"
         in find_sql
     )
     assert find_parameters["athlete_id"] == 2
 
     assert (
-        "WHERE StrengthSessionID = :session_id"
+        "WHERE strength_session_id = :session_id"
         in update_sql
     )
-    assert "AND AthleteID = :athlete_id" in update_sql
+    assert "AND athlete_id = :athlete_id" in update_sql
     assert update_parameters["athlete_id"] == 2
 
 
@@ -209,9 +214,9 @@ def test_sync_run_log_keeps_update_inside_athlete_scope() -> None:
     find_sql, find_parameters = connection.calls[0]
     update_sql, update_parameters = connection.calls[1]
 
-    assert "WHERE AthleteID = :athlete_id" in find_sql
+    assert "WHERE athlete_id = :athlete_id" in find_sql
     assert (
-        "AND ExternalActivityID = :external_id"
+        "AND external_activity_id = :external_id"
         in find_sql
     )
     assert find_parameters == {
@@ -219,8 +224,8 @@ def test_sync_run_log_keeps_update_inside_athlete_scope() -> None:
         "external_id": "RUN-TEST-001",
     }
 
-    assert "WHERE ActivityID = :activity_id" in update_sql
-    assert "AND AthleteID = :athlete_id" in update_sql
+    assert "WHERE activity_id = :activity_id" in update_sql
+    assert "AND athlete_id = :athlete_id" in update_sql
     assert update_parameters["athlete_id"] == 2
     assert update_parameters["activity_id"] == 202
 
@@ -228,7 +233,7 @@ def test_sync_run_log_keeps_update_inside_athlete_scope() -> None:
         update_sql.split("SET", 1)[1]
         .split("WHERE", 1)[0]
     )
-    assert "AthleteID" not in update_set_clause
+    assert "athlete_id" not in update_set_clause
 
 
 def test_sync_daily_wellness_uses_correct_lookup_parameters() -> None:
@@ -253,8 +258,8 @@ def test_sync_daily_wellness_uses_correct_lookup_parameters() -> None:
     find_sql, find_parameters = connection.calls[0]
     update_sql, update_parameters = connection.calls[1]
 
-    assert "WHERE AthleteID = :athlete_id" in find_sql
-    assert "WellnessDate = :wellness_date" in find_sql
+    assert "WHERE athlete_id = :athlete_id" in find_sql
+    assert "wellness_date = :wellness_date" in find_sql
     assert ":daily_wellness_id" not in find_sql
     assert find_parameters == {
         "athlete_id": 2,
@@ -262,9 +267,102 @@ def test_sync_daily_wellness_uses_correct_lookup_parameters() -> None:
     }
 
     assert (
-        "WHERE DailyWellnessID =" in update_sql
+        "WHERE daily_wellness_id =" in update_sql
     )
     assert ":daily_wellness_id" in update_sql
-    assert "AND AthleteID = :athlete_id" in update_sql
+    assert "AND athlete_id = :athlete_id" in update_sql
     assert update_parameters["daily_wellness_id"] == 303
     assert update_parameters["athlete_id"] == 2
+
+
+def test_sync_strength_exercises_use_scoped_parent_session() -> None:
+    connection = RecordingConnection()
+    frame = pd.DataFrame(
+        [
+            {
+                "Strength ID": "STR-20260901-001",
+                "Session ID": "STR-SESSION-20260901",
+                "Exercise": "Goblet Squat",
+                "Category": "Lower",
+                "Load kg": 20,
+                "Sets": 3,
+                "Reps / Duration": "10",
+                "Volume kg": 600,
+                "RPE 1-10": 7,
+                "Side": "Both",
+                "Coaching Notes": "Slow eccentric",
+                "ExerciseCompletedBool": True,
+            }
+        ]
+    )
+
+    inserted, updated = sync_strength_exercise_log(
+        connection,
+        frame,
+        athlete_id=2,
+    )
+
+    assert (inserted, updated) == (0, 1)
+
+    session_sql, session_parameters = connection.calls[0]
+    find_sql, find_parameters = connection.calls[1]
+    update_sql, update_parameters = connection.calls[2]
+
+    assert "FROM public.strength_sessions" in session_sql
+    assert "WHERE athlete_id = :athlete_id" in session_sql
+    assert session_parameters == {
+        "athlete_id": 2,
+        "external_session_id": "STR-SESSION-20260901",
+    }
+
+    assert "FROM public.strength_exercises" in find_sql
+    assert "WHERE strength_session_id = :session_id" in find_sql
+    assert find_parameters == {
+        "session_id": 101,
+        "external_strength_id": "STR-20260901-001",
+    }
+
+    assert "WHERE strength_exercise_id = :strength_exercise_id" in update_sql
+    assert "AND strength_session_id = :session_id" in update_sql
+    assert update_parameters["strength_exercise_id"] == 404
+    assert update_parameters["session_id"] == 101
+    assert update_parameters["exercise_name"] == "Goblet Squat"
+
+
+def test_read_strength_exercises_preserves_workout_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = pd.DataFrame(
+        [
+            {
+                "Strength ID": "STR-20260901-001",
+                "Date": "2026-09-01",
+                "Exercise": "Goblet Squat",
+                "Category": "Lower",
+                "Load kg": 20,
+                "Sets": 3,
+                "Reps / Duration": "10",
+                "Volume kg": 600,
+                "RPE 1-10": 7,
+                "Side": "Both",
+                "Coaching Notes": "Slow eccentric",
+                "Exercise Completed": "Yes",
+                "Session ID": "STR-SESSION-20260901",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(
+        pd,
+        "read_excel",
+        lambda *args, **kwargs: source.copy(),
+    )
+
+    result = read_strength_exercise_log(Path("runner.xlsx"))
+
+    assert len(result) == 1
+    assert result.loc[0, "Exercise"] == "Goblet Squat"
+    assert result.loc[0, "Sets"] == 3
+    assert result.loc[0, "Reps / Duration"] == "10"
+    assert result.loc[0, "RPE 1-10"] == 7
+    assert bool(result.loc[0, "ExerciseCompletedBool"]) is True
