@@ -294,8 +294,8 @@ def complete_runner_onboarding(
                 :full_name,
                 :date_of_birth,
                 :sex,
-                :height_cm,
-                :weight_kg,
+                CAST(:height_cm AS NUMERIC),
+                CAST(:weight_kg AS NUMERIC),
                 :latest_pr_distance_m,
                 :latest_pr_completed_duration_sec,
                 :latest_pr_achieved_date
