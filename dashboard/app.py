@@ -479,6 +479,7 @@ def show_runner_onboarding(app_user_id: int) -> None:
             date_of_birth = st.date_input(
                 "Ngày sinh (không bắt buộc)",
                 value=None,
+                min_value=date(1900, 1, 1),
                 max_value=date.today(),
             )
 
