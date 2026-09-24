@@ -1143,6 +1143,255 @@ else:
     )
 
 
+
+
+
+st.header("1. Lịch tập hiện tại")
+
+
+schedule_scope = st.segmented_control(
+    "Phạm vi lịch",
+    options=[
+        "14 ngày tới",
+        "Toàn bộ plan",
+    ],
+    default="14 ngày tới",
+)
+
+if schedule.empty:
+    st.info(
+        "Plan chưa có PlannedWorkouts."
+    )
+else:
+    display_schedule = schedule.copy()
+
+    display_schedule["ScheduledDate"] = (
+        pd.to_datetime(
+            display_schedule[
+                "ScheduledDate"
+            ]
+        )
+    )
+
+    if schedule_scope == "14 ngày tới":
+        today = pd.Timestamp.today().normalize()
+        end_date = today + pd.Timedelta(
+            days=14
+        )
+
+        display_schedule = display_schedule[
+            (
+                display_schedule[
+                    "ScheduledDate"
+                ] >= today
+            )
+            & (
+                display_schedule[
+                    "ScheduledDate"
+                ] <= end_date
+            )
+        ].copy()
+
+    schedule_for_details = display_schedule.copy()
+
+
+    display_schedule["PlannedKm"] = (
+        display_schedule["PlannedDistanceM"]
+        / 1000
+    )
+
+    display_schedule["PlannedMinutes"] = (
+        display_schedule["PlannedDurationSec"]
+        / 60
+    )
+
+    display_schedule["TargetPace"] = (
+        display_schedule[
+            "TargetPaceSecPerKm"
+        ].apply(
+            lambda value: (
+                f"{int(value) // 60}:"
+                f"{int(value) % 60:02d}/km"
+                if pd.notna(value)
+                else ""
+            )
+        )
+    )
+
+    display_schedule = display_schedule[
+        [
+            "ScheduledDate",
+            "WorkoutType",
+            "WorkoutName",
+            "PlannedKm",
+            "PlannedMinutes",
+            "TargetPace",
+            "Status",
+        ]
+    ]
+
+    st.dataframe(
+        display_schedule,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "ScheduledDate": st.column_config.DateColumn(
+                "Ngày",
+                format="YYYY-MM-DD",
+            ),
+            "PlannedKm": st.column_config.NumberColumn(
+                "Planned km",
+                format="%.1f",
+            ),
+            "PlannedMinutes":
+                st.column_config.NumberColumn(
+                    "Planned min",
+                    format="%.0f",
+                ),
+        },
+    )
+
+
+    schedule_csv = display_schedule.to_csv(
+        index=False
+    ).encode("utf-8-sig")
+
+    st.download_button(
+        label="Tải lịch tập CSV",
+        data=schedule_csv,
+        file_name=(
+            f"training_plan_"
+            f"{selected_plan_id}.csv"
+        ),
+        mime="text/csv",
+    )
+
+    st.subheader("Hướng dẫn từng buổi")
+
+    if not strength_details.empty:
+        strength_details = strength_details.copy()
+        strength_details["SessionDate"] = pd.to_datetime(
+            strength_details["SessionDate"]
+        ).dt.normalize()
+
+    if not mobility_details.empty:
+        mobility_details = mobility_details.copy()
+        mobility_details["SessionDate"] = pd.to_datetime(
+            mobility_details["SessionDate"]
+        ).dt.normalize()
+
+    detailed_workout_count = 0
+
+    for workout in schedule_for_details.itertuples():
+        scheduled_date = pd.Timestamp(
+            workout.ScheduledDate
+        ).normalize()
+        workout_strength = pd.DataFrame()
+        workout_mobility = pd.DataFrame()
+
+        if not strength_details.empty:
+            workout_strength = strength_details[
+                strength_details["SessionDate"] == scheduled_date
+            ].copy()
+
+        if not mobility_details.empty:
+            workout_mobility = mobility_details[
+                mobility_details["SessionDate"] == scheduled_date
+            ].copy()
+
+        workout_notes = (
+            str(workout.Notes).strip()
+            if pd.notna(workout.Notes)
+            else ""
+        )
+
+        if (
+            workout_strength.empty
+            and workout_mobility.empty
+            and not workout_notes
+        ):
+            continue
+
+        detailed_workout_count += 1
+        expander_label = (
+            f"{scheduled_date:%Y-%m-%d} · "
+            f"{workout.WorkoutName}"
+        )
+
+        with st.expander(expander_label):
+            if workout_notes:
+                st.markdown("**Lưu ý của buổi tập**")
+                st.text(workout_notes)
+
+            if not workout_strength.empty:
+                st.markdown("**Strength**")
+                strength_display = workout_strength[
+                    [
+                        "ExerciseName",
+                        "ExerciseCategory",
+                        "PlannedLoadKg",
+                        "PlannedSets",
+                        "PlannedRepsOrDuration",
+                        "PlannedRPE",
+                        "ExerciseSide",
+                        "CoachingNotes",
+                        "ExerciseCompleted",
+                    ]
+                ].rename(
+                    columns={
+                        "ExerciseName": "Bài tập",
+                        "ExerciseCategory": "Nhóm",
+                        "PlannedLoadKg": "Tạ kg",
+                        "PlannedSets": "Sets",
+                        "PlannedRepsOrDuration": "Reps / thời lượng",
+                        "PlannedRPE": "RPE",
+                        "ExerciseSide": "Bên",
+                        "CoachingNotes": "Hướng dẫn",
+                        "ExerciseCompleted": "Đã hoàn thành",
+                    }
+                )
+
+                st.dataframe(
+                    strength_display,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "Tạ kg": st.column_config.NumberColumn(
+                            format="%.1f"
+                        ),
+                        "Đã hoàn thành": (
+                            st.column_config.CheckboxColumn()
+                        ),
+                    },
+                )
+
+            if not workout_mobility.empty:
+                st.markdown("**Mobility / activation**")
+
+                for mobility in workout_mobility.itertuples():
+                    if pd.notna(mobility.Routine):
+                        routine_sections = str(
+                            mobility.Routine
+                        ).split("|")
+
+                        for section in routine_sections:
+                            instructions = [
+                                instruction.strip()
+                                for instruction in section.split(";")
+                                if instruction.strip()
+                            ]
+
+                            for instruction in instructions:
+                                st.text(f"• {instruction}")
+
+    if detailed_workout_count == 0:
+        st.info(
+            "Chưa có hướng dẫn Strength, Mobility "
+            "hoặc Notes cho phạm vi đang chọn."
+        )
+
+
+
 render_training_entry(
     engine=engine,
     athlete_id=int(current_athlete_id),
@@ -1153,8 +1402,7 @@ render_training_entry(
 st.divider()
 
 
-
-st.header("1. Adaptive Plan")
+st.header("2. Adaptive Plan")
 
 
 if adaptive.empty:
@@ -1626,7 +1874,7 @@ if (
 
 
 
-st.header("2. Tiến độ theo tuần")
+st.header("3. Tiến độ theo tuần")
 
 
 if weekly.empty:
@@ -1692,7 +1940,7 @@ else:
         )
 
 
-st.header("3. Readiness và Fatigue")
+st.header("4. Readiness và Fatigue")
 
 
 if readiness.empty:
@@ -1777,250 +2025,6 @@ else:
             hide_index=True,
         )
 
-
-st.header("4. Lịch tập hiện tại")
-
-
-schedule_scope = st.segmented_control(
-    "Phạm vi lịch",
-    options=[
-        "14 ngày tới",
-        "Toàn bộ plan",
-    ],
-    default="14 ngày tới",
-)
-
-if schedule.empty:
-    st.info(
-        "Plan chưa có PlannedWorkouts."
-    )
-else:
-    display_schedule = schedule.copy()
-
-    display_schedule["ScheduledDate"] = (
-        pd.to_datetime(
-            display_schedule[
-                "ScheduledDate"
-            ]
-        )
-    )
-
-    if schedule_scope == "14 ngày tới":
-        today = pd.Timestamp.today().normalize()
-        end_date = today + pd.Timedelta(
-            days=14
-        )
-
-        display_schedule = display_schedule[
-            (
-                display_schedule[
-                    "ScheduledDate"
-                ] >= today
-            )
-            & (
-                display_schedule[
-                    "ScheduledDate"
-                ] <= end_date
-            )
-        ].copy()
-
-    schedule_for_details = display_schedule.copy()
-
-
-    display_schedule["PlannedKm"] = (
-        display_schedule["PlannedDistanceM"]
-        / 1000
-    )
-
-    display_schedule["PlannedMinutes"] = (
-        display_schedule["PlannedDurationSec"]
-        / 60
-    )
-
-    display_schedule["TargetPace"] = (
-        display_schedule[
-            "TargetPaceSecPerKm"
-        ].apply(
-            lambda value: (
-                f"{int(value) // 60}:"
-                f"{int(value) % 60:02d}/km"
-                if pd.notna(value)
-                else ""
-            )
-        )
-    )
-
-    display_schedule = display_schedule[
-        [
-            "ScheduledDate",
-            "WorkoutType",
-            "WorkoutName",
-            "PlannedKm",
-            "PlannedMinutes",
-            "TargetPace",
-            "Status",
-        ]
-    ]
-
-    st.dataframe(
-        display_schedule,
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "ScheduledDate": st.column_config.DateColumn(
-                "Ngày",
-                format="YYYY-MM-DD",
-            ),
-            "PlannedKm": st.column_config.NumberColumn(
-                "Planned km",
-                format="%.1f",
-            ),
-            "PlannedMinutes":
-                st.column_config.NumberColumn(
-                    "Planned min",
-                    format="%.0f",
-                ),
-        },
-    )
-
-
-    schedule_csv = display_schedule.to_csv(
-        index=False
-    ).encode("utf-8-sig")
-
-    st.download_button(
-        label="Tải lịch tập CSV",
-        data=schedule_csv,
-        file_name=(
-            f"training_plan_"
-            f"{selected_plan_id}.csv"
-        ),
-        mime="text/csv",
-    )
-
-    st.subheader("Hướng dẫn từng buổi")
-
-    if not strength_details.empty:
-        strength_details = strength_details.copy()
-        strength_details["SessionDate"] = pd.to_datetime(
-            strength_details["SessionDate"]
-        ).dt.normalize()
-
-    if not mobility_details.empty:
-        mobility_details = mobility_details.copy()
-        mobility_details["SessionDate"] = pd.to_datetime(
-            mobility_details["SessionDate"]
-        ).dt.normalize()
-
-    detailed_workout_count = 0
-
-    for workout in schedule_for_details.itertuples():
-        scheduled_date = pd.Timestamp(
-            workout.ScheduledDate
-        ).normalize()
-        workout_strength = pd.DataFrame()
-        workout_mobility = pd.DataFrame()
-
-        if not strength_details.empty:
-            workout_strength = strength_details[
-                strength_details["SessionDate"] == scheduled_date
-            ].copy()
-
-        if not mobility_details.empty:
-            workout_mobility = mobility_details[
-                mobility_details["SessionDate"] == scheduled_date
-            ].copy()
-
-        workout_notes = (
-            str(workout.Notes).strip()
-            if pd.notna(workout.Notes)
-            else ""
-        )
-
-        if (
-            workout_strength.empty
-            and workout_mobility.empty
-            and not workout_notes
-        ):
-            continue
-
-        detailed_workout_count += 1
-        expander_label = (
-            f"{scheduled_date:%Y-%m-%d} · "
-            f"{workout.WorkoutName}"
-        )
-
-        with st.expander(expander_label):
-            if workout_notes:
-                st.markdown("**Lưu ý của buổi tập**")
-                st.text(workout_notes)
-
-            if not workout_strength.empty:
-                st.markdown("**Strength**")
-                strength_display = workout_strength[
-                    [
-                        "ExerciseName",
-                        "ExerciseCategory",
-                        "PlannedLoadKg",
-                        "PlannedSets",
-                        "PlannedRepsOrDuration",
-                        "PlannedRPE",
-                        "ExerciseSide",
-                        "CoachingNotes",
-                        "ExerciseCompleted",
-                    ]
-                ].rename(
-                    columns={
-                        "ExerciseName": "Bài tập",
-                        "ExerciseCategory": "Nhóm",
-                        "PlannedLoadKg": "Tạ kg",
-                        "PlannedSets": "Sets",
-                        "PlannedRepsOrDuration": "Reps / thời lượng",
-                        "PlannedRPE": "RPE",
-                        "ExerciseSide": "Bên",
-                        "CoachingNotes": "Hướng dẫn",
-                        "ExerciseCompleted": "Đã hoàn thành",
-                    }
-                )
-
-                st.dataframe(
-                    strength_display,
-                    width="stretch",
-                    hide_index=True,
-                    column_config={
-                        "Tạ kg": st.column_config.NumberColumn(
-                            format="%.1f"
-                        ),
-                        "Đã hoàn thành": (
-                            st.column_config.CheckboxColumn()
-                        ),
-                    },
-                )
-
-            if not workout_mobility.empty:
-                st.markdown("**Mobility / activation**")
-
-                for mobility in workout_mobility.itertuples():
-                    if pd.notna(mobility.Routine):
-                        routine_sections = str(
-                            mobility.Routine
-                        ).split("|")
-
-                        for section in routine_sections:
-                            instructions = [
-                                instruction.strip()
-                                for instruction in section.split(";")
-                                if instruction.strip()
-                            ]
-
-                            for instruction in instructions:
-                                st.text(f"• {instruction}")
-
-    if detailed_workout_count == 0:
-        st.info(
-            "Chưa có hướng dẫn Strength, Mobility "
-            "hoặc Notes cho phạm vi đang chọn."
-        )
 
 
 

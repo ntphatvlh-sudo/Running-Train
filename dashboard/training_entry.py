@@ -359,9 +359,19 @@ def render_support_form(
     with st.form(
         f"{support_type.lower()}_status_form"
     ):
-        selected_label = st.selectbox(
+        session_ids = (
+            sessions["session_id"]
+            .astype(int)
+            .tolist()
+        )
+
+        selected_session_id = st.selectbox(
             f"Buổi {display_name}",
-            options=sessions["label"].tolist(),
+            options=session_ids,
+            format_func=lambda session_id: sessions.loc[
+                sessions["session_id"] == session_id,
+                "label",
+            ].iloc[0],
         )
 
         result_label = st.radio(
@@ -387,7 +397,7 @@ def render_support_form(
         return
 
     selected = sessions[
-        sessions["label"] == selected_label
+        sessions["session_id"] == selected_session_id
     ].iloc[0]
 
     status = (
