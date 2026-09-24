@@ -43,6 +43,10 @@ from src.invitations import (
     create_invitation,
 )
 
+from dashboard.training_entry import (
+    render_training_entry,
+)
+
 st.set_page_config(
     page_title="Running Training Analytics",
     page_icon="🏃",
@@ -1138,6 +1142,15 @@ else:
         "Chưa xác định thời gian import gần nhất."
     )
 
+
+render_training_entry(
+    engine=engine,
+    athlete_id=int(current_athlete_id),
+    plan_id=int(selected_plan_id),
+    clear_dashboard_cache=read_query.clear,
+)
+
+st.divider()
 
 
 

@@ -5,8 +5,9 @@ A SQL Server and Streamlit project for analyzing running-plan adherence, support
 
 ## Main features
 
-- Import Run Log, Strength Log, Mobility Log, and Daily Wellness from Excel.
-- Store and analyze data in Microsoft SQL Server.
+- Enter Run, Strength, Mobility, and Daily Wellness directly in the Streamlit web app.
+- Use PostgreSQL on Neon as the primary training-data store.
+- Keep Excel import only for intentional Training Calendar synchronization.
 - Calculate running completion by workout, week, and plan.
 - Analyze Strength and Mobility completion separately.
 - Recommend plan reduction when run completion is below 75%.
@@ -146,16 +147,16 @@ Personal `.xlsx` files are excluded from Git.
 .\.venv\Scripts\python.exe .\src\test_connection.py
 ```
 
-### 8. Validate the Excel import
+### 8. Validate the Training Calendar
 
 ```powershell
-.\.venv\Scripts\python.exe .\src\import_excel.py --dry-run
+.\.venv\Scripts\python.exe .\src\import_excel.py --sync-calendar --dry-run
 ```
 
-### 9. Import log data
+### 9. Synchronize the Training Calendar when intentional
 
 ```powershell
-.\.venv\Scripts\python.exe .\src\import_excel.py
+.\.venv\Scripts\python.exe .\src\import_excel.py --sync-calendar
 ```
 
 Normal imports do not use `--sync-calendar`, so Excel does not overwrite adaptive workout changes stored in SQL Server.
@@ -171,7 +172,7 @@ Open `http://localhost:8501` if the browser does not open automatically.
 ## Data safety
 
 - `.env` is local and must not be committed.
-- Personal Excel workbooks are excluded from Git.
-- Preview an adaptive-plan change before applying it.
+- Run, Strength, Mobility, and Daily Wellness are written through authenticated web forms.
+- Excel synchronization is calendar-only and requires the explicit `--sync-calendar` flag.
 - Applied adjustments retain workout version history.
 - Use rollback only for the latest applicable adjustment.

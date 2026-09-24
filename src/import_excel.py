@@ -1509,198 +1509,63 @@ def main() -> None:
             f"Không tìm thấy file Excel: {args.excel_file}"
         )
 
-    # Mặc định không đọc Training Calendar.
-    calendar = None
-
-    # Chỉ đọc Training Calendar khi người dùng
-    # chạy script với cờ --sync-calendar.
-    if args.sync_calendar:
-        calendar = read_training_calendar(args.excel_file)
-
-    # Các log này luôn được đọc khi chạy import.
-    run_log = read_run_log(args.excel_file)
-    daily_wellness = read_daily_wellness(args.excel_file)
-    strength_log = read_strength_log(args.excel_file)
-    strength_exercise_log = read_strength_exercise_log(
-        args.excel_file
-    )
-    mobility_log = read_mobility_log(args.excel_file)
-
-    # Hiển thị số lượng dữ liệu đã đọc.
-    if calendar is not None:
-        print(
-            f"Training Calendar hợp lệ: "
-            f"{len(calendar)} dòng"
+    if not args.sync_calendar:
+        raise ValueError(
+            "Importer hiện chỉ dùng để đồng bộ "
+            "Training Calendar. "
+            "Hãy chạy lại với cờ --sync-calendar. "
+            "Run, Strength, Mobility và Daily Wellness "
+            "được nhập trực tiếp trên web."
         )
 
-    print(
-        f"Run Log hợp lệ: "
-        f"{len(run_log)} dòng"
+    calendar = read_training_calendar(
+        args.excel_file
     )
 
     print(
-    f"Daily Wellness hợp lệ: "
-    f"{len(daily_wellness)} ngày"
+        f"Training Calendar hợp lệ: "
+        f"{len(calendar)} dòng"
     )
 
-    print(
-        f"Strength sessions hợp lệ: "
-        f"{len(strength_log)} buổi"
-    )
-
-    print(
-        f"Strength exercises hợp lệ: "
-        f"{len(strength_exercise_log)} động tác"
-    )
-
-    print(
-        f"Mobility sessions hợp lệ: "
-        f"{len(mobility_log)} buổi"
-    )
-
-    # DRY RUN chỉ kiểm tra Excel.
-    # Không mở transaction ghi dữ liệu.
     if args.dry_run:
         print(
             "DRY RUN hoàn tất. "
-            "Không có dữ liệu nào được ghi vào PostgreSQL."
+            "Training Calendar hợp lệ và "
+            "không có dữ liệu nào được ghi "
+            "vào PostgreSQL."
         )
         return
 
-    # Giá trị mặc định của kết quả calendar.
-    plan_inserted = 0
-    plan_updated = 0
-
-    # Mở transaction PostgreSQL.
     with engine.begin() as connection:
         ensure_athlete_exists(
             connection,
             args.athlete_id,
         )
 
-        # Chỉ đồng bộ calendar khi có --sync-calendar.
-        if calendar is not None:
-            plans = load_plans(
-                connection,
-                args.athlete_id,
-            )
+        plans = load_plans(
+            connection,
+            args.athlete_id,
+        )
 
-            preview_plan_mapping(
+        preview_plan_mapping(
+            calendar,
+            plans,
+        )
+
+        plan_inserted, plan_updated = (
+            sync_training_calendar(
+                connection,
                 calendar,
                 plans,
             )
-
-            plan_inserted, plan_updated = (
-                sync_training_calendar(
-                    connection,
-                    calendar,
-                    plans,
-                )
-            )
-
-        # Run Log luôn được đồng bộ.
-        run_inserted, run_updated = (
-            sync_run_log(
-                connection,
-                run_log,
-                args.athlete_id,
-            )
-        )
-        # Đồng bộ Daily wellness
-        wellness_inserted, wellness_updated = (
-            sync_daily_wellness(
-                connection,
-                daily_wellness,
-                args.athlete_id,
-            )
         )
 
-        # Strength Log luôn được đồng bộ.
-        strength_inserted, strength_updated = (
-            sync_strength_log(
-                connection,
-                strength_log,
-                args.athlete_id,
-            )
-        )
-
-        (
-            strength_exercise_inserted,
-            strength_exercise_updated,
-        ) = sync_strength_exercise_log(
-            connection,
-            strength_exercise_log,
-            args.athlete_id,
-        )
-
-        # Mobility Log luôn được đồng bộ.
-        mobility_inserted, mobility_updated = (
-            sync_mobility_log(
-                connection,
-                mobility_log,
-                args.athlete_id,
-            )
-        )
-
-        # Xây dựng lại các RULE match để dữ liệu mới có thể sửa
-        # những match lệch ngày đã được tạo từ lần import trước.
-        # Các match MANUAL luôn được giữ nguyên.
-        (
-            rule_matches_removed,
-            rule_matches_created,
-        ) = rebuild_rule_run_matches(
-            connection,
-            args.athlete_id,
-        )
-
-    print("Đồng bộ hoàn tất.")
-
-    if calendar is not None:
-        print(
-            f"PlannedWorkouts: "
-            f"thêm {plan_inserted}, "
-            f"cập nhật {plan_updated}"
-        )
-    else:
-        print(
-            "PlannedWorkouts: không đồng bộ "
-            "(không có cờ --sync-calendar)"
-        )
+    print("Đồng bộ Training Calendar hoàn tất.")
 
     print(
-        f"CompletedActivities: "
-        f"thêm {run_inserted}, "
-        f"cập nhật {run_updated}"
-    )
-
-    print(
-        f"DailyWellness: "
-        f"thêm {wellness_inserted}, "
-        f"cập nhật {wellness_updated}"
-    )
-
-    print(
-        f"StrengthSessions: "
-        f"thêm {strength_inserted}, "
-        f"cập nhật {strength_updated}"
-    )
-
-    print(
-        f"StrengthExercises: "
-        f"thêm {strength_exercise_inserted}, "
-        f"cập nhật {strength_exercise_updated}"
-    )
-
-    print(
-        f"MobilitySessions: "
-        f"thêm {mobility_inserted}, "
-        f"cập nhật {mobility_updated}"
-    )
-
-    print(
-        f"WorkoutMatches RULE: xóa "
-        f"{rule_matches_removed}, tạo lại "
-        f"{rule_matches_created}"
+        f"PlannedWorkouts: "
+        f"thêm {plan_inserted}, "
+        f"cập nhật {plan_updated}"
     )
 
 
