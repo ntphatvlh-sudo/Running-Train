@@ -509,16 +509,29 @@ def render_wellness_form(
             ["Ngày", "Trạng thái", "Readiness"]
         ]
 
-    st.caption("Tình trạng Wellness 14 ngày gần nhất")
+    pending_dates = recent_dates[
+        recent_dates["Trạng thái"] == "⬜ Chưa cập nhật"
+    ].copy()
 
-    st.dataframe(
-        recent_dates.sort_values(
-            "Ngày",
-            ascending=False,
-        ),
-        use_container_width=True,
-        hide_index=True,
+    st.caption(
+        "Ngày Wellness chưa cập nhật "
+        "(14 ngày gần nhất)"
     )
+
+    if pending_dates.empty:
+        st.success(
+            "Bạn đã cập nhật Wellness đủ 14 ngày gần nhất."
+        )
+    else:
+        st.dataframe(
+            pending_dates.sort_values(
+                "Ngày",
+                ascending=False,
+            ),
+            use_container_width=True,
+            height=180,
+            hide_index=True,
+        )
     with st.form("daily_wellness_form"):
         wellness_date = st.date_input(
             "Ngày",
