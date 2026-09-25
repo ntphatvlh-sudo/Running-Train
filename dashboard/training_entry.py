@@ -440,6 +440,85 @@ def render_wellness_form(
     athlete_id: int,
     clear_dashboard_cache,
 ) -> None:
+    today = date.today()
+    start_date = today - pd.Timedelta(days=13)
+
+    wellness_history = load_records(
+        engine,
+        """
+        SELECT
+            wellness_date AS "WellnessDate",
+            readiness_score AS "ReadinessScore"
+        FROM public.daily_wellness
+        WHERE athlete_id = :athlete_id
+          AND wellness_date BETWEEN
+              :start_date AND :end_date
+        ORDER BY wellness_date DESC
+        """,
+        {
+            "athlete_id": athlete_id,
+            "start_date": start_date,
+            "end_date": today,
+        },
+    )
+
+    recent_dates = pd.DataFrame(
+        {
+            "Ngày": pd.date_range(
+                start=start_date,
+                end=today,
+                freq="D",
+            ).date
+        }
+    )
+
+    if wellness_history.empty:
+        recent_dates["Trạng thái"] = (
+            "⬜ Chưa cập nhật"
+        )
+        recent_dates["Readiness"] = None
+    else:
+        wellness_history["Ngày"] = pd.to_datetime(
+            wellness_history["WellnessDate"]
+        ).dt.date
+
+        recent_dates = recent_dates.merge(
+            wellness_history[
+                ["Ngày", "ReadinessScore"]
+            ],
+            on="Ngày",
+            how="left",
+        )
+
+        recent_dates["Trạng thái"] = (
+            recent_dates["ReadinessScore"]
+            .notna()
+            .map(
+                {
+                    True: "✅ Đã cập nhật",
+                    False: "⬜ Chưa cập nhật",
+                }
+            )
+        )
+
+        recent_dates["Readiness"] = recent_dates[
+            "ReadinessScore"
+        ]
+
+        recent_dates = recent_dates[
+            ["Ngày", "Trạng thái", "Readiness"]
+        ]
+
+    st.caption("Tình trạng Wellness 14 ngày gần nhất")
+
+    st.dataframe(
+        recent_dates.sort_values(
+            "Ngày",
+            ascending=False,
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
     with st.form("daily_wellness_form"):
         wellness_date = st.date_input(
             "Ngày",
