@@ -697,6 +697,7 @@ def render_wellness_form(
         refresh_after_save(
             clear_dashboard_cache
         )
+        st.rerun()
 
     except (
         WorkoutLoggingError,

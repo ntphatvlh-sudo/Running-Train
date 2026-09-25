@@ -806,11 +806,33 @@ plan_names = {
 }
 
 
+saved_plan_id = None
+saved_plan_id_raw = st.query_params.get("plan_id")
+
+if saved_plan_id_raw is not None:
+    try:
+        candidate_plan_id = int(saved_plan_id_raw)
+    except (TypeError, ValueError):
+        candidate_plan_id = None
+
+    if candidate_plan_id in plan_names:
+        saved_plan_id = candidate_plan_id
+
+default_plan_index = (
+    list(plan_names.keys()).index(saved_plan_id)
+    if saved_plan_id is not None
+    else 0
+)
+
 selected_plan_id = st.sidebar.selectbox(
     "Chọn Training Plan",
     options=list(plan_names.keys()),
+    index=default_plan_index,
+    key="selected_training_plan",
     format_func=lambda plan_id: plan_names[plan_id],
 )
+
+st.query_params["plan_id"] = str(selected_plan_id)
 
 
 previous_plan_id = st.session_state.get(
