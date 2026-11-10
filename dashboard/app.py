@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import logging
 
 import sys
 import time
@@ -10,8 +11,12 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from sqlalchemy import text
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
+from dashboard.plan_preview import render_ten_k_preview
 
+
+logger = logging.getLogger(__name__)
 
 # Cho phép dashboard import src.database
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -82,20 +87,14 @@ def safe_read_query(
             params,
         )
 
-    except Exception as error:
-        st.error(
-            f"Không thể tải khu vực: "
-            f"{section_name}"
+    except Exception:
+        logger.exception(
+            "Could not load dashboard section %s",
+            section_name,
         )
-
-        with st.expander(
-            f"Chi tiết lỗi — {section_name}"
-        ):
-            st.code(
-                f"{type(error).__name__}: "
-                f"{error}"
-            )
-
+        st.error(
+            f"Could not load {section_name}."
+        )
         return pd.DataFrame()
 
 VALID_ADJUSTMENT_TYPES = {
@@ -112,8 +111,8 @@ def normalize_adjustment_type(
 
     if normalized_type not in VALID_ADJUSTMENT_TYPES:
         raise ValueError(
-            "Adjustment type phải là "
-            "REDUCTION hoặc PROGRESSION."
+            "Adjustment should be "
+            "REDUCTION or PROGRESSION."
         )
 
     return normalized_type
@@ -131,6 +130,7 @@ def execute_preview_procedure(
     preview_type: str,
     plan_id: int,
     window_days: int,
+    connection: Connection | None = None,
 ) -> list[pd.DataFrame]:
     """
     Gọi function Preview PostgreSQL.
@@ -157,15 +157,23 @@ def execute_preview_procedure(
         """
     )
 
-    with engine.connect() as connection:
-        rows = connection.execute(
+    params = {
+        "plan_id": int(plan_id),
+        "window_days": int(window_days),
+        "adjustment_type": normalized_type,
+    }
+
+    def fetch_rows(query_connection):
+        return query_connection.execute(
             statement,
-            {
-                "plan_id": int(plan_id),
-                "window_days": int(window_days),
-                "adjustment_type": normalized_type,
-            },
+            params,
         ).mappings().all()
+
+    if connection is None:
+        with engine.connect() as query_connection:
+            rows = fetch_rows(query_connection)
+    else:
+        rows = fetch_rows(connection)
 
     result_frames: list[pd.DataFrame] = []
 
@@ -191,10 +199,58 @@ def execute_preview_procedure(
     return result_frames
 
 
+def preview_frames_match(
+    saved_frames: list[pd.DataFrame],
+    current_frames: list[pd.DataFrame],
+) -> bool:
+    if len(saved_frames) != len(current_frames):
+        return False
+
+    for saved_frame, current_frame in zip(
+        saved_frames,
+        current_frames,
+    ):
+        saved_records = json.loads(
+            saved_frame.to_json(
+                orient="records",
+                date_format="iso",
+            )
+        )
+        current_records = json.loads(
+            current_frame.to_json(
+                orient="records",
+                date_format="iso",
+            )
+        )
+
+        saved_records = sorted(
+            json.dumps(record, sort_keys=True)
+            for record in saved_records
+        )
+        current_records = sorted(
+            json.dumps(record, sort_keys=True)
+            for record in current_records
+        )
+
+        if saved_records != current_records:
+            return False
+
+    return True
+
+class PreviewChangedError(Exception):
+    def __init__(
+        self,
+        current_frames: list[pd.DataFrame],
+    ) -> None:
+        super().__init__("Preview data changed.")
+        self.current_frames = current_frames
+
+
 def execute_apply_procedure(
     adjustment_type: str,
     plan_id: int,
     window_days: int,
+    expected_preview_frames: list[pd.DataFrame] | None = None,
 ) -> list[pd.DataFrame]:
     """
     Apply Adaptive Plan trong một transaction.
@@ -227,6 +283,27 @@ def execute_apply_procedure(
     )
 
     with engine.begin() as connection:
+        connection.execute(
+            text(
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+            )
+        )
+
+        if expected_preview_frames is not None:
+            current_preview_frames = execute_preview_procedure(
+                adjustment_type,
+                plan_id,
+                window_days,
+                connection=connection,
+            )
+
+            if not preview_frames_match(
+                expected_preview_frames,
+                current_preview_frames,
+            ):
+                raise PreviewChangedError(
+                    current_preview_frames
+                )
         rows = connection.execute(
             statement,
             {
@@ -299,37 +376,42 @@ def format_optional_number(
 
 
 def show_database_error(error: Exception) -> None:
-    st.error(
-        "Không thể đọc dữ liệu từ PostgreSQL."
+    logger.error(
+        "Database operation failed: %s",
+        type(error).__name__,
+        exc_info=(
+            type(error),
+            error,
+            error.__traceback__,
+        ),
     )
 
-    st.code(
-        f"{type(error).__name__}: {error}"
+    st.error(
+        "Could not connect to PostgreSQL or run the query."
     )
 
     st.info(
-        "Hãy kiểm tra PostgreSQL, file .env "
-        "và thử lại bằng test_connection.py."
+        "Please check the database connection and try again."
     )
 
 def show_owner_invitation_manager(
     app_user_id: int,
     owner_accesses: list[AthleteAccess],
 ) -> None:
-    st.header("Quản lý lời mời")
+    st.header("Invitation Manage")
 
     invitation_type = st.radio(
-        "Loại lời mời",
+        "Invitation Type",
         options=(
             NEW_RUNNER_INVITATION,
             EXISTING_ATHLETE_INVITATION,
         ),
         format_func=lambda value: {
             NEW_RUNNER_INVITATION: (
-                "Runner mới — tự tạo hồ sơ"
+                "New Runner — Create new profile"
             ),
             EXISTING_ATHLETE_INVITATION: (
-                "Truy cập athlete hiện có"
+                "Access another athlete profile"
             ),
         }[value],
         horizontal=True,
@@ -343,7 +425,7 @@ def show_owner_invitation_manager(
 
     with st.form("owner_invitation_form"):
         email = st.text_input(
-            "Gmail người nhận *",
+            "Recipient's Gmail *",
             max_chars=320,
         )
 
@@ -352,8 +434,8 @@ def show_owner_invitation_manager(
             access_role = "RUNNER"
 
             st.caption(
-                "Người nhận sẽ tự tạo hồ sơ athlete "
-                "trong lần đăng nhập đầu tiên."
+                "Recipients will create their profile"
+                "upon their first login."
             )
         else:
             athlete_id = st.selectbox(
@@ -369,7 +451,7 @@ def show_owner_invitation_manager(
             )
 
             access_role = st.selectbox(
-                "Vai trò *",
+                "Role *",
                 options=(
                     "RUNNER",
                     "COACH",
@@ -378,16 +460,16 @@ def show_owner_invitation_manager(
             )
 
         expiry_option = st.selectbox(
-            "Thời hạn lời mời",
+            "Invitation duration",
             options=(
-                "Không hết hạn",
-                "7 ngày",
-                "30 ngày",
+                "Unlimited",
+                "7 days",
+                "30 days",
             ),
         )
 
         submitted = st.form_submit_button(
-            "Tạo lời mời",
+            "Create invitation",
             type="primary",
         )
 
@@ -395,13 +477,13 @@ def show_owner_invitation_manager(
         return
 
     if not email.strip():
-        st.error("Vui lòng nhập Gmail người nhận.")
+        st.error("Please fill Recipient's email.")
         return
 
     try:
         email = normalize_email(email)
     except ValueError:
-        st.error("Gmail người nhận không đúng định dạng.")
+        st.error("The recipient's Gmail address is not in the correct format.")
         return
 
     expires_at = None
@@ -409,9 +491,9 @@ def show_owner_invitation_manager(
         tzinfo=None
     )
 
-    if expiry_option == "7 ngày":
+    if expiry_option == "7 days":
         expires_at = now_utc + timedelta(days=7)
-    elif expiry_option == "30 ngày":
+    elif expiry_option == "30 days":
         expires_at = now_utc + timedelta(days=30)
 
     request = InvitationRequest(
@@ -430,42 +512,42 @@ def show_owner_invitation_manager(
             )
     except InvitationError:
         st.error(
-            "Không thể xác minh kết quả tạo lời mời."
+            "Unable to verify the result of the invitation creation."
         )
         return
     except SQLAlchemyError:
         st.error(
-            "Không thể tạo lời mời. Gmail có thể "
-            "đã được mời, đã có quyền hoặc không "
-            "thỏa điều kiện truy cập."
+            "Unable to create invitation. The Gmail account may "
+            "have been invited, already granted access, "
+            "or deemed ineligible for access."
         )
         return
 
     invitation_target = (
         invitation.athlete_name
         if invitation.athlete_name is not None
-        else "runner mới"
+        else "New runner"
     )
 
     st.success(
-        f"Đã tạo lời mời #{invitation.invitation_id} "
-        f"cho {invitation.email_normalized} — "
+        f"Invitation is sent #{invitation.invitation_id} "
+        f"to {invitation.email_normalized} — "
         f"{invitation.access_role} / "
         f"{invitation_target}."
     )
 
 
 def show_runner_onboarding(app_user_id: int) -> None:
-    st.title("🏃 Thiết lập hồ sơ vận động viên")
+    st.title("🏃 Establish Athlete's training profile")
 
     st.info(
-        "Hãy hoàn tất thông tin thể trạng và thành tích "
-        "gần nhất để hệ thống chuẩn bị lịch tập phù hợp."
+        "Please fill your newest physical condition and "
+        "performance to have the suitable training plan."
     )
 
     with st.form("runner_onboarding_form"):
         full_name = st.text_input(
-            "Họ và tên *",
+            "Full name *",
             max_chars=150,
         )
 
@@ -473,7 +555,7 @@ def show_runner_onboarding(app_user_id: int) -> None:
 
         with profile_col_1:
             height_cm = st.number_input(
-                "Chiều cao (cm) *",
+                "Height (cm) *",
                 min_value=80.0,
                 max_value=250.0,
                 value=None,
@@ -481,7 +563,7 @@ def show_runner_onboarding(app_user_id: int) -> None:
             )
 
             date_of_birth = st.date_input(
-                "Ngày sinh (không bắt buộc)",
+                "Date of birth (Optional)",
                 value=None,
                 min_value=date(1900, 1, 1),
                 max_value=date.today(),
@@ -489,7 +571,7 @@ def show_runner_onboarding(app_user_id: int) -> None:
 
         with profile_col_2:
             weight_kg = st.number_input(
-                "Cân nặng (kg) *",
+                "Weight (kg) *",
                 min_value=25.0,
                 max_value=300.0,
                 value=None,
@@ -497,7 +579,7 @@ def show_runner_onboarding(app_user_id: int) -> None:
             )
 
             sex = st.selectbox(
-                "Giới tính (không bắt buộc)",
+                "Sex (Optional)",
                 options=(
                     None,
                     "MALE",
@@ -506,20 +588,18 @@ def show_runner_onboarding(app_user_id: int) -> None:
                     "PREFER_NOT_TO_SAY",
                 ),
                 format_func=lambda value: {
-                    None: "Không cung cấp",
-                    "MALE": "Nam",
-                    "FEMALE": "Nữ",
-                    "OTHER": "Khác",
-                    "PREFER_NOT_TO_SAY": (
-                        "Không muốn trả lời"
-                    ),
+                    None: "Prefer not to provide",
+                    "MALE": "Male",
+                    "FEMALE": "Female",
+                    "OTHER": "Other",
+                    "PREFER_NOT_TO_SAY": "Prefer not to say",
                 }[value],
             )
 
         st.subheader("Latest PR")
 
         pr_distance_km = st.number_input(
-            "Cự ly hoàn thành (km) *",
+            "Distance (km) *",
             min_value=0.01,
             value=None,
             step=0.1,
@@ -529,7 +609,7 @@ def show_runner_onboarding(app_user_id: int) -> None:
 
         with time_col_1:
             pr_hours = st.number_input(
-                "Giờ *",
+                "hour *",
                 min_value=0,
                 value=0,
                 step=1,
@@ -537,7 +617,7 @@ def show_runner_onboarding(app_user_id: int) -> None:
 
         with time_col_2:
             pr_minutes = st.number_input(
-                "Phút *",
+                "Minutes *",
                 min_value=0,
                 max_value=59,
                 value=0,
@@ -546,7 +626,7 @@ def show_runner_onboarding(app_user_id: int) -> None:
 
         with time_col_3:
             pr_seconds = st.number_input(
-                "Giây *",
+                "Seconds *",
                 min_value=0,
                 max_value=59,
                 value=0,
@@ -554,13 +634,13 @@ def show_runner_onboarding(app_user_id: int) -> None:
             )
 
         pr_achieved_date = st.date_input(
-            "Ngày đạt PR *",
+            "Date of PR *",
             value=date.today(),
             max_value=date.today(),
         )
 
         submitted = st.form_submit_button(
-            "Hoàn tất onboarding",
+            "Onboarding completed",
             type="primary",
         )
 
@@ -570,19 +650,19 @@ def show_runner_onboarding(app_user_id: int) -> None:
     normalized_full_name = full_name.strip()
 
     if not normalized_full_name:
-        st.error("Họ và tên là bắt buộc.")
+        st.error("Full name is required.")
         return
 
     if height_cm is None:
-        st.error("Chiều cao là bắt buộc.")
+        st.error("Height is required.")
         return
 
     if weight_kg is None:
-        st.error("Cân nặng là bắt buộc.")
+        st.error("Weight is required.")
         return
 
     if pr_distance_km is None:
-        st.error("Cự ly Latest PR là bắt buộc.")
+        st.error("Latest PR distance is required.")
         return
 
     completed_duration_sec = (
@@ -593,8 +673,8 @@ def show_runner_onboarding(app_user_id: int) -> None:
 
     if completed_duration_sec <= 0:
         st.error(
-            "Thời gian hoàn thành Latest PR "
-            "phải lớn hơn 0."
+            "Finish time of Latest PR "
+            "must be greater than 0."
         )
         return
 
@@ -622,18 +702,18 @@ def show_runner_onboarding(app_user_id: int) -> None:
             )
     except OnboardingError:
         st.error(
-            "Không thể hoàn tất onboarding vì kết quả "
-            "cấp quyền không hợp lệ."
+            "Unable to complete onboarding because of  "
+            "invalid authorization result."
         )
         return
     except SQLAlchemyError:
         st.error(
-            "Không thể lưu hồ sơ vào PostgreSQL. "
-            "Vui lòng thử lại."
+            "Can not save profile into PostgreSQL. "
+            "PLease try again."
         )
         return
 
-    st.success("Đã hoàn tất hồ sơ vận động viên.")
+    st.success("Athlete profile completed.")
     st.rerun()
 
 
@@ -641,12 +721,11 @@ def require_authorization() -> AuthorizationResult:
     if not st.user.is_logged_in:
         st.title("🏃 Running Training Analytics")
         st.info(
-            "Ứng dụng riêng tư. "
-            "Vui lòng đăng nhập bằng tài khoản Google "
-            "đã được mời."
+            "Private application. "
+            "Please login by invited Google account."
         )
         st.button(
-            "Đăng nhập bằng Google",
+            "Sign in with Google",
             on_click=st.login,
             type="primary",
         )
@@ -664,17 +743,17 @@ def require_authorization() -> AuthorizationResult:
             )
     except (ValueError, AuthorizationError):
         st.error(
-            "Google không cung cấp danh tính hợp lệ "
-            "hoặc quyền vận động viên không hợp lệ."
+            "Google does not provide a valid identity "
+            "or invalid athlete eligibility."
         )
     except SQLAlchemyError:
         st.error(
-            "Tài khoản Google này chưa được mời, "
-            "đã bị khóa hoặc chưa có quyền truy cập."
+            "Google account is uninvited, "
+            "blocked or no access yet."
         )
 
     st.button(
-        "Đăng xuất",
+        "Sign out",
         on_click=st.logout,
         key="authorization_logout",
     )
@@ -693,7 +772,7 @@ if (
     )
 
     st.button(
-        "Đăng xuất",
+        "Sign out",
         on_click=st.logout,
         key="onboarding_logout",
     )
@@ -701,7 +780,7 @@ if (
     st.stop()
 
 if authorization.authorization_state != AUTHORIZED_STATE:
-    st.error("Trạng thái cấp quyền không hợp lệ.")
+    st.error("Invalid authorization state.")
     st.stop()
 
 authorized_accesses = list(authorization.accesses)
@@ -716,11 +795,11 @@ if len(access_by_athlete_id) == 1:
         iter(access_by_athlete_id.values())
     )
     st.sidebar.caption(
-        f"Vận động viên: {current_access.full_name}"
+        f"Athlete: {current_access.full_name}"
     )
 else:
     selected_athlete_id = st.sidebar.selectbox(
-        "Chọn vận động viên",
+        "Choose athlete",
         options=list(access_by_athlete_id.keys()),
         format_func=lambda athlete_id: (
             access_by_athlete_id[
@@ -734,12 +813,18 @@ else:
 
 current_athlete_id = current_access.athlete_id
 
+st.divider()
+render_ten_k_preview(
+    read_query=read_query,
+    athlete_id=int(current_athlete_id),
+)
+
 st.sidebar.caption(
-    f"Vai trò: {current_access.access_role}"
+    f"Role: {current_access.access_role}"
 )
 
 st.sidebar.button(
-    "Đăng xuất",
+    "Sign out",
     on_click=st.logout,
     key="sidebar_logout",
 )
@@ -748,8 +833,8 @@ st.sidebar.button(
 st.title("🏃 Running Training Analytics")
 
 st.caption(
-    "Theo dõi completion, readiness, "
-    "Strength, Mobility và Adaptive Plan."
+    "Track completion, readiness, strength, mobility, "
+    "and adaptive plan recommendations."
 )
 
 owner_accesses = [
@@ -760,7 +845,7 @@ owner_accesses = [
 
 if owner_accesses:
     with st.expander(
-        "✉️ Quản lý lời mời",
+        "✉️ Invitation management",
         expanded=False,
     ):
         show_owner_invitation_manager(
@@ -791,7 +876,7 @@ except Exception as error:
 
 if plans.empty:
     st.warning(
-        "Chưa có Training Plan trong PostgreSQL."
+        "No Training Plan exists in PostgreSQL."
     )
     st.stop()
 
@@ -825,7 +910,7 @@ default_plan_index = (
 )
 
 selected_plan_id = st.sidebar.selectbox(
-    "Chọn Training Plan",
+    "Choose Training Plan",
     options=list(plan_names.keys()),
     index=default_plan_index,
     key="selected_training_plan",
@@ -853,7 +938,7 @@ st.session_state["preview_plan_id"] = (
 )
 
 
-if st.sidebar.button("Làm mới dữ liệu"):
+if st.sidebar.button("Refresh data"):
     st.cache_data.clear()
 
     st.session_state.pop(
@@ -913,7 +998,7 @@ adaptive = safe_read_query(
     {"plan_id": selected_plan_id},
 )
 weekly = safe_read_query(
-    "Tiến độ theo tuần",
+    "Weekly progress",
     """
     SELECT
         plan_id AS "PlanID",
@@ -947,7 +1032,7 @@ weekly = safe_read_query(
     {"plan_id": selected_plan_id},
 )
 readiness = safe_read_query(
-    "Readiness và Fatigue",
+    "Readiness and Fatigue",
     """
     SELECT
         plan_id AS "PlanID",
@@ -972,7 +1057,7 @@ readiness = safe_read_query(
     {"plan_id": selected_plan_id},
 )
 schedule = safe_read_query(
-    "Lịch tập hiện tại",
+    "Current plan",
     """
     SELECT
         planned_workout_id AS "PlannedWorkoutID",
@@ -993,7 +1078,7 @@ schedule = safe_read_query(
     {"plan_id": selected_plan_id},
 )
 strength_details = safe_read_query(
-    "Chi tiết Strength",
+    "Detailed Strength",
     """
     SELECT
         strength.session_date AS "SessionDate",
@@ -1030,7 +1115,7 @@ strength_details = safe_read_query(
     },
 )
 mobility_details = safe_read_query(
-    "Chi tiết Mobility",
+    "Detailed Mobility",
     """
     SELECT
         mobility.session_date AS "SessionDate",
@@ -1039,11 +1124,17 @@ mobility_details = safe_read_query(
     FROM public.mobility_sessions AS mobility
     JOIN public.training_plans AS training_plan
       ON training_plan.plan_id = :plan_id
-     AND training_plan.athlete_id = mobility.athlete_id
-     AND mobility.session_date BETWEEN
-            training_plan.start_date
-            AND training_plan.end_date
+     AND training_plan.athlete_id = :athlete_id
     WHERE mobility.athlete_id = :athlete_id
+      AND (
+          mobility.plan_id = :plan_id
+          OR (
+              mobility.plan_id IS NULL
+              AND mobility.session_date BETWEEN
+                  training_plan.start_date
+                  AND training_plan.end_date
+          )
+      )
     ORDER BY mobility.session_date
     """,
     {
@@ -1051,63 +1142,69 @@ mobility_details = safe_read_query(
         "athlete_id": current_athlete_id,
     },
 )
-history = safe_read_query(
-    "Lịch sử điều chỉnh",
-    """
-    SELECT
-        adjustment_run_id AS "AdjustmentRunID",
-        adjustment_type AS "AdjustmentType",
-        adjustment_status AS "AdjustmentStatus",
-        completion_percent AS "CompletionPercent",
-        reduction_percent AS "ReductionPercent",
-        increase_percent AS "IncreasePercent",
-        window_start_date AS "WindowStartDate",
-        window_end_date AS "WindowEndDate",
-        scheduled_date AS "ScheduledDate",
-        workout_type AS "WorkoutType",
-        previous_workout_name AS "PreviousWorkoutName",
-        new_workout_name AS "NewWorkoutName",
-        previous_planned_distance_m
-            AS "PreviousPlannedDistanceM",
-        new_planned_distance_m
-            AS "NewPlannedDistanceM",
-        changed_at AS "ChangedAt"
-    FROM public.vw_planned_workout_version_history
-    WHERE plan_id = :plan_id
-    ORDER BY
-        adjustment_run_id DESC,
-        scheduled_date
-    """,
-    {"plan_id": selected_plan_id},
-)
+try:
+    history = read_query(
+        """
+        SELECT
+            adjustment_run_id AS "AdjustmentRunID",
+            adjustment_type AS "AdjustmentType",
+            adjustment_status AS "AdjustmentStatus",
+            completion_percent AS "CompletionPercent",
+            reduction_percent AS "ReductionPercent",
+            increase_percent AS "IncreasePercent",
+            window_start_date AS "WindowStartDate",
+            window_end_date AS "WindowEndDate",
+            scheduled_date AS "ScheduledDate",
+            workout_type AS "WorkoutType",
+            previous_workout_name AS "PreviousWorkoutName",
+            new_workout_name AS "NewWorkoutName",
+            previous_planned_distance_m
+                AS "PreviousPlannedDistanceM",
+            new_planned_distance_m
+                AS "NewPlannedDistanceM",
+            changed_at AS "ChangedAt"
+        FROM public.vw_planned_workout_version_history
+        WHERE plan_id = :plan_id
+        ORDER BY
+            adjustment_run_id DESC,
+            scheduled_date
+        """,
+        {"plan_id": selected_plan_id},
+    )
+except SQLAlchemyError as error:
+    show_database_error(error)
+    st.stop()
 
-latest_applied_adjustment = read_query(
-    """
-    SELECT
-        adjustment_run_id AS "AdjustmentRunID",
-        plan_id AS "PlanID",
-        adjustment_type AS "AdjustmentType",
-        status AS "Status",
-        completion_rate AS "CompletionRate",
-        reduction_rate AS "ReductionRate",
-        increase_rate AS "IncreaseRate",
-        window_start_date AS "WindowStartDate",
-        window_end_date AS "WindowEndDate",
-        reason AS "Reason",
-        created_at AS "CreatedAt",
-        applied_at AS "AppliedAt"
-    FROM public.plan_adjustment_runs
-    WHERE plan_id = :plan_id
-      AND status = 'APPLIED'
-    ORDER BY adjustment_run_id DESC
-    LIMIT 1
-    """,
-    {"plan_id": selected_plan_id},
-)
-
+try:
+    latest_applied_adjustment = read_query(
+        """
+        SELECT
+            adjustment_run_id AS "AdjustmentRunID",
+            plan_id AS "PlanID",
+            adjustment_type AS "AdjustmentType",
+            status AS "Status",
+            completion_rate AS "CompletionRate",
+            reduction_rate AS "ReductionRate",
+            increase_rate AS "IncreaseRate",
+            window_start_date AS "WindowStartDate",
+            window_end_date AS "WindowEndDate",
+            reason AS "Reason",
+            created_at AS "CreatedAt",
+            applied_at AS "AppliedAt"
+        FROM public.plan_adjustment_runs
+        WHERE plan_id = :plan_id
+            AND status = 'APPLIED'
+        ORDER BY adjustment_run_id DESC
+        LIMIT 1
+        """,
+        {"plan_id": selected_plan_id},
+    )
+except SQLAlchemyError as error:
+    show_database_error(error)
+    st.stop()
 
 data_freshness = safe_read_query(
-    "Thời gian cập nhật dữ liệu",
+    "Data update time",
     """
     SELECT
         MAX(imported_at) AS "LatestImportAt"
@@ -1156,33 +1253,33 @@ if (
     ]
 
     st.sidebar.caption(
-        "SQL cập nhật gần nhất: "
+        "Latest PostgreSQL update: "
         f"{latest_import_at:%Y-%m-%d %H:%M:%S}"
     )
 else:
     st.sidebar.caption(
-        "Chưa xác định thời gian import gần nhất."
+        "Most recent import time not yet determined."
     )
 
 
 
 
 
-st.header("1. Lịch tập hiện tại")
+st.header("1. Current Plan")
 
 
 schedule_scope = st.segmented_control(
-    "Phạm vi lịch",
+    "Range",
     options=[
-        "14 ngày tới",
-        "Toàn bộ plan",
+        "Next 14 days",
+        "Full plan",
     ],
-    default="14 ngày tới",
+    default="Next 14 days",
 )
 
 if schedule.empty:
     st.info(
-        "Plan chưa có PlannedWorkouts."
+        "The plan does not yet have any PlannedWorkouts."
     )
 else:
     display_schedule = schedule.copy()
@@ -1195,8 +1292,17 @@ else:
         )
     )
 
-    if schedule_scope == "14 ngày tới":
-        today = pd.Timestamp.today().normalize()
+    if schedule_scope == "Next 14 days":
+        try:
+            with engine.connect() as connection:
+                database_today = connection.execute(
+                    text("SELECT CURRENT_DATE")
+                ).scalar_one()
+        except SQLAlchemyError as error:
+            show_database_error(error)
+            st.stop()
+
+        today = pd.Timestamp(database_today).normalize()
         end_date = today + pd.Timedelta(
             days=14
         )
@@ -1258,7 +1364,7 @@ else:
         hide_index=True,
         column_config={
             "ScheduledDate": st.column_config.DateColumn(
-                "Ngày",
+                "Date",
                 format="YYYY-MM-DD",
             ),
             "PlannedKm": st.column_config.NumberColumn(
@@ -1279,7 +1385,7 @@ else:
     ).encode("utf-8-sig")
 
     st.download_button(
-        label="Tải lịch tập CSV",
+        label="Download plan as CSV",
         data=schedule_csv,
         file_name=(
             f"training_plan_"
@@ -1288,7 +1394,7 @@ else:
         mime="text/csv",
     )
 
-    st.subheader("Hướng dẫn từng buổi")
+    st.subheader("Detail instruction")
 
     if not strength_details.empty:
         strength_details = strength_details.copy()
@@ -1342,7 +1448,7 @@ else:
 
         with st.expander(expander_label):
             if workout_notes:
-                st.markdown("**Lưu ý của buổi tập**")
+                st.markdown("**Training note**")
                 st.text(workout_notes)
 
             if not workout_strength.empty:
@@ -1361,15 +1467,15 @@ else:
                     ]
                 ].rename(
                     columns={
-                        "ExerciseName": "Bài tập",
-                        "ExerciseCategory": "Nhóm",
-                        "PlannedLoadKg": "Tạ kg",
+                        "ExerciseName": "Excercise",
+                        "ExerciseCategory": "Category",
+                        "PlannedLoadKg": "Load (Kg)",
                         "PlannedSets": "Sets",
-                        "PlannedRepsOrDuration": "Reps / thời lượng",
+                        "PlannedRepsOrDuration": "Reps / Duration",
                         "PlannedRPE": "RPE",
-                        "ExerciseSide": "Bên",
-                        "CoachingNotes": "Hướng dẫn",
-                        "ExerciseCompleted": "Đã hoàn thành",
+                        "ExerciseSide": "Side",
+                        "CoachingNotes": "Instructions",
+                        "ExerciseCompleted": "Completed",
                     }
                 )
 
@@ -1378,10 +1484,10 @@ else:
                     width="stretch",
                     hide_index=True,
                     column_config={
-                        "Tạ kg": st.column_config.NumberColumn(
+                        "Load (Kg)": st.column_config.NumberColumn(
                             format="%.1f"
                         ),
-                        "Đã hoàn thành": (
+                        "Completed": (
                             st.column_config.CheckboxColumn()
                         ),
                     },
@@ -1408,8 +1514,8 @@ else:
 
     if detailed_workout_count == 0:
         st.info(
-            "Chưa có hướng dẫn Strength, Mobility "
-            "hoặc Notes cho phạm vi đang chọn."
+            "No Strength, Mobility instruction"
+            "or Notes for chosen region."
         )
 
 
@@ -1429,7 +1535,7 @@ st.header("2. Adaptive Plan")
 
 if adaptive.empty:
     st.info(
-        "Plan này chưa có đủ dữ liệu để tạo "
+        "This plan does not have enough data to be created"
         "Adaptive Plan recommendation."
     )
 else:
@@ -1447,7 +1553,7 @@ else:
     )
 
     column2.metric(
-        "Reduction đề xuất",
+        "Proposed Reduction",
         format_percent(
             result[
                 "RecommendedReductionPercent"
@@ -1456,7 +1562,7 @@ else:
     )
 
     column3.metric(
-        "Progression đề xuất",
+        "Proposed Progression",
         format_percent(
             result[
                 "RecommendedIncreasePercent"
@@ -1465,7 +1571,7 @@ else:
     )
 
     column4.metric(
-        "Readiness thấp nhất",
+        "Lowest Readiness",
         format_optional_number(
             result["MinimumAverageReadiness"]
         ),
@@ -1475,15 +1581,15 @@ else:
 
     if adaptive_action == "CONTROLLED PROGRESSION":
         st.success(
-            f"Đề xuất: {adaptive_action}"
+            f"Propose: {adaptive_action}"
         )
     elif "REDUCTION" in str(adaptive_action):
         st.warning(
-            f"Đề xuất: {adaptive_action}"
+            f"Propose: {adaptive_action}"
         )
     else:
         st.info(
-            f"Đề xuất: {adaptive_action}"
+            f"Propose: {adaptive_action}"
         )
 
     st.write(
@@ -1495,7 +1601,7 @@ else:
     )
 
     race_column.metric(
-        "Ngày Race tiếp theo",
+        "The next race",
         (
             result["NextRaceDate"].strftime(
                 "%Y-%m-%d"
@@ -1506,7 +1612,7 @@ else:
     )
 
     fatigue_column.metric(
-        "Fatigue cao nhất (2 tuần)",
+        "Highest fatigue (2 weeks)",
         format_optional_number(
             result["MaximumAverageFatigue"]
         ),
@@ -1537,11 +1643,11 @@ if (
         == int(selected_plan_id)
 ):
     st.success(
-        "Adaptive Plan đã được Apply thành công."
+        "Adaptive Plan is applied successfully."
     )
 
     st.caption(
-        f"Loại adjustment: "
+        f"Adjustment type: "
         f"{apply_success['adjustment_type']}"
     )
 
@@ -1554,7 +1660,7 @@ if (
             )
 
     if st.button(
-        "Đóng thông báo Apply",
+        "Close Apply Notification",
         type="secondary",
     ):
         st.session_state.pop(
@@ -1566,7 +1672,7 @@ if (
 
 
 window_days = st.number_input(
-    "Số ngày cần xem trước",
+    "Preview window (days)",
     min_value=1,
     max_value=28,
     value=7,
@@ -1576,7 +1682,7 @@ window_days = st.number_input(
 
 if adaptive.empty:
     st.info(
-        "Chưa có Adaptive Plan để Preview."
+        "There is no Adaptive Plan for Preview."
     )
 
 else:
@@ -1616,27 +1722,27 @@ else:
     if reduction_percent > 0:
         preview_type = "REDUCTION"
         preview_label = (
-            f"Xem trước giảm tải "
+            f"Reduction preview "
             f"{reduction_percent:.1f}%"
         )
 
     elif increase_percent > 0:
         preview_type = "PROGRESSION"
         preview_label = (
-            f"Xem trước tăng tải "
+            f"Progression preview "
             f"{increase_percent:.1f}%"
         )
 
     else:
         st.info(
-            "Adaptive Plan hiện đề nghị giữ nguyên. "
-            "Không có thay đổi cần Preview."
+            "Adaptive Plan is proposed to remain unchanged."
+            "No Adjustment to Preview."
         )
 
     if preview_type is not None:
         st.warning(
-            "Preview chỉ hiển thị đề xuất. "
-            "Dữ liệu PlannedWorkouts chưa bị thay đổi."
+            "Preview only show proposions. "
+            "PlannedWorkouts have not been changed."
         )
 
         if st.button(
@@ -1645,7 +1751,7 @@ else:
         ):
             try:
                 with st.spinner(
-                    "Đang tạo Preview..."
+                    "Preview Creating..."
                 ):
                     frames = (
                         execute_preview_procedure(
@@ -1673,15 +1779,13 @@ else:
                     # Token riêng cho các widget xác nhận.
                     "preview_token": time.time_ns(),
                 }
-            except Exception as error:
+            except Exception:
                 st.error(
-                    "Không thể tạo Adaptive Plan "
+                    "Unable to create Adaptive Plan "
                     "Preview."
                 )
-
-                st.code(
-                    f"{type(error).__name__}: "
-                    f"{error}"
+                logger.exception(
+                    "Adaptive Plan Preview failed"
                 )
 
 
@@ -1694,20 +1798,20 @@ if (
     and preview_data["plan_id"]
         == int(selected_plan_id)
 ):
-    st.markdown("#### Kết quả Preview")
+    st.markdown("#### Preview Result")
 
     st.caption(
-        f"Loại: "
+        f"Type: "
         f"{preview_data['preview_type']} | "
-        f"Khoảng xem trước: "
-        f"{preview_data['window_days']} ngày"
+        f"Range: "
+        f"{preview_data['window_days']} days"
     )
 
     frames = preview_data["frames"]
 
     if not frames:
         st.info(
-            "Stored procedure không trả về "
+            "Stored procedure does not return "
             "result set."
         )
 
@@ -1716,14 +1820,14 @@ if (
         start=1,
     ):
         if index == 1:
-            result_name = "Kết luận"
+            result_name = "Conclusion"
         elif index == len(frames):
             result_name = (
-                "Danh sách workout đề xuất"
+                "List of proposed workout plans"
             )
         else:
             result_name = (
-                f"Thông tin bổ sung {index - 1}"
+                f"Additional information {index - 1}"
             )
 
         st.markdown(
@@ -1732,7 +1836,7 @@ if (
 
         if frame.empty:
             st.info(
-                "Không có workout cần thay đổi."
+                "No workout to change."
             )
         else:
             st.dataframe(
@@ -1770,14 +1874,14 @@ if (
 
     if not has_proposed_workouts:
         st.info(
-            "Preview không có workout cần thay đổi. "
-            "Không thể Apply."
+            "Preview has no workout to change "
+            "Unable to Apply."
         )
 
     elif preview_is_expired:
         st.warning(
-            "Preview đã quá 10 phút và hết hiệu lực. "
-            "Hãy đóng Preview và tạo lại."
+            "Preview is older than 10 mins and expired. "
+            "Please close Preview and recreate."
         )
 
     else:
@@ -1786,15 +1890,15 @@ if (
         )
 
         st.error(
-            "Apply sẽ thay đổi trực tiếp "
-            "PlannedWorkouts. Phiên bản cũ sẽ "
-            "được lưu trong lịch sử SQL."
+            "Apply will change directly "
+            "PlannedWorkouts. Last version will be "
+            "saved in SQL history."
         )
 
         confirmation_checked = st.checkbox(
             (
-                "Tôi đã kiểm tra danh sách workout "
-                "và đồng ý áp dụng thay đổi."
+                "I have checked list of workouts "
+                "and agree to apply changes."
             ),
             key=(
                 "apply_checked_"
@@ -1804,7 +1908,7 @@ if (
 
         typed_confirmation = st.text_input(
             (
-                "Nhập chính xác câu xác nhận: "
+                "Fill confirmation correctly: "
                 f"{confirmation_phrase}"
             ),
             key=(
@@ -1830,18 +1934,15 @@ if (
         ):
             try:
                 with st.spinner(
-                    "Đang kiểm tra và Apply..."
+                    "Checking and Applying..."
                 ):
                     apply_frames = (
                         execute_apply_procedure(
-                            preview_data[
-                                "preview_type"
-                            ],
+                            preview_data["preview_type"],
                             int(selected_plan_id),
-                            int(
-                                preview_data[
-                                    "window_days"
-                                ]
+                            int(preview_data["window_days"]),
+                            expected_preview_frames=(
+                                preview_data["frames"]
                             ),
                         )
                     )
@@ -1870,21 +1971,41 @@ if (
 
                 st.rerun()
 
-            except Exception as error:
-                st.error(
-                    "Không thể Apply Adaptive Plan. "
-                    "SQL đã rollback thay đổi."
-                )
+            except PreviewChangedError as error:
+                st.session_state[
+                    "adaptive_preview"
+                ] = {
+                    "plan_id": int(selected_plan_id),
+                    "preview_type": preview_data[
+                        "preview_type"
+                    ],
+                    "window_days": int(
+                        preview_data["window_days"]
+                    ),
+                    "frames": error.current_frames,
+                    "created_at": time.time(),
+                    "preview_token": time.time_ns(),
+                }
 
-                st.code(
-                    f"{type(error).__name__}: "
-                    f"{error}"
+                st.warning(
+                    "The plan changed after Preview. "
+                    "Review the refreshed Preview before applying."
+                )
+                st.rerun()
+
+            except Exception:
+                st.error(
+                    "Unable to apply Adaptive Plan. "
+                    "Please review the server log."
+                )
+                logger.exception(
+                    "Adaptive Plan Apply failed"
                 )
 
 
 
     if st.button(
-        "Đóng Preview",
+        "Close Preview",
         type="secondary",
     ):
         st.session_state.pop(
@@ -1896,12 +2017,12 @@ if (
 
 
 
-st.header("3. Tiến độ theo tuần")
+st.header("3. Progression by Week")
 
 
 if weekly.empty:
     st.info(
-        "Chưa có dữ liệu completion theo tuần."
+        "No completion data by week."
     )
 else:
     weekly_chart = weekly[
@@ -1926,8 +2047,7 @@ else:
         color="Metric",
         markers=True,
         title=(
-            "Run, Strength và Mobility "
-            "completion theo tuần"
+            "Run, Strength, and Mobility completion by week"
         ),
     )
 
@@ -1953,7 +2073,7 @@ else:
     )
 
     with st.expander(
-        "Xem dữ liệu completion theo tuần"
+        "View completion data by week"
     ):
         st.dataframe(
             weekly,
@@ -1962,12 +2082,12 @@ else:
         )
 
 
-st.header("4. Readiness và Fatigue")
+st.header("4. Readiness and Fatigue")
 
 
 if readiness.empty:
     st.info(
-        "Chưa có dữ liệu readiness theo tuần."
+        "No readiness data by week."
     )
 else:
     readiness_column1, readiness_column2 = (
@@ -1979,7 +2099,7 @@ else:
         x="WeekStartDate",
         y="AverageReadinessScore",
         markers=True,
-        title="Readiness trung bình theo tuần",
+        title="Average Readiness by week",
     )
 
     readiness_figure.add_hline(
@@ -2019,7 +2139,7 @@ else:
         y="Score",
         color="Metric",
         markers=True,
-        title="Fatigue, Stress và Soreness",
+        title="Fatigue, Stress and Soreness",
     )
 
     fatigue_figure.add_hline(
@@ -2039,7 +2159,7 @@ else:
     )
 
     with st.expander(
-        "Xem dữ liệu readiness theo tuần"
+        "View readiness by week"
     ):
         st.dataframe(
             readiness,
@@ -2050,12 +2170,12 @@ else:
 
 
 
-st.header("5. Lịch sử điều chỉnh")
+st.header("5. Adjustment history")
 
 
 if history.empty:
     st.info(
-        "Plan chưa có lịch sử adjustment."
+        "No Plan adjustment History."
     )
 else:
     st.dataframe(
@@ -2068,7 +2188,7 @@ else:
     ).encode("utf-8-sig")
 
     st.download_button(
-        label="Tải lịch sử CSV",
+        label="Download history as CSV",
         data=history_csv,
         file_name=(
             f"adjustment_history_"
@@ -2090,7 +2210,7 @@ if (
         == int(selected_plan_id)
 ):
     st.success(
-        "Adjustment đã được rollback thành công."
+        "Adjustment have been rolled back successfully."
     )
 
     for frame in rollback_success["frames"]:
@@ -2102,7 +2222,7 @@ if (
             )
 
     if st.button(
-        "Đóng thông báo Rollback",
+        "Close Rollback notification",
         type="secondary",
     ):
         st.session_state.pop(
@@ -2115,8 +2235,7 @@ if (
 
 if latest_applied_adjustment.empty:
     st.info(
-        "Plan không có adjustment APPLIED "
-        "có thể rollback."
+        "No APPLIED adjustment to rollback"
     )
 
 else:
@@ -2133,8 +2252,7 @@ else:
     )
 
     st.warning(
-        "Chỉ adjustment APPLIED mới nhất "
-        "được phép rollback."
+        "Only the latest APPLIED adjustment can be rolled back."
     )
 
     rollback_column1, rollback_column2, (
@@ -2166,14 +2284,14 @@ else:
     )
 
     st.write(
-        f"Khoảng điều chỉnh: "
+        f"Adjustment range: "
         f"{latest_adjustment['WindowStartDate']} "
         f"→ "
         f"{latest_adjustment['WindowEndDate']}"
     )
 
     st.write(
-        f"Lý do: "
+        f"Reason: "
         f"{latest_adjustment['Reason']}"
     )
 
@@ -2183,13 +2301,13 @@ else:
     ].copy()
 
     st.markdown(
-        "#### Các workout sẽ được khôi phục"
+        "#### Workouts will be restored"
     )
 
     if rollback_workouts.empty:
         st.error(
-            "Không tìm thấy lịch sử workout cho "
-            "adjustment này. Không thể rollback."
+            "No workout history found for this adjustment "
+            "Unable to rollback."
         )
 
     else:
@@ -2213,14 +2331,13 @@ else:
         )
 
         st.error(
-            "Rollback sẽ thay phiên bản hiện tại "
-            "bằng dữ liệu trước adjustment."
+            "Rollback will restore the version before adjustment."
         )
 
         rollback_checked = st.checkbox(
             (
-                "Tôi đã kiểm tra danh sách và "
-                "đồng ý rollback adjustment."
+                "I checked the list and "
+                "agree to rollback adjustment."
             ),
             key=(
                 "rollback_checked_"
@@ -2230,7 +2347,7 @@ else:
 
         rollback_text = st.text_input(
             (
-                "Nhập chính xác câu xác nhận: "
+                "Fill confirmation correctly: "
                 f"{rollback_phrase}"
             ),
             key=(
@@ -2256,7 +2373,7 @@ else:
         ):
             try:
                 with st.spinner(
-                    "Đang rollback..."
+                    "Rolling back..."
                 ):
                     rollback_frames = (
                         execute_rollback_procedure(
@@ -2288,21 +2405,19 @@ else:
                 st.cache_data.clear()
                 st.rerun()
 
-            except Exception as error:
+            except Exception:
                 st.error(
-                    "Không thể rollback. "
-                    "SQL đã hủy giao dịch."
+                    "Unable to roll back adjustment. "
+                    "Please review the server log."
                 )
-
-                st.code(
-                    f"{type(error).__name__}: "
-                    f"{error}"
+                logger.exception(
+                    "Adaptive Plan Rollback failed"
                 )
 
 
 
 st.caption(
-    "Adaptive Plan hỗ trợ Preview, Apply và "
-    "Rollback có xác nhận. Mọi thay đổi được "
-    "lưu lịch sử trong PostgreSQL."
+    "Adaptive Plan supports Preview, Apply and "
+    "Rollback with confirmation."
+    "Changes are saved in PostgreSQL."
 )

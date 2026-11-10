@@ -6,3 +6,5 @@ psycopg[binary]==3.3.5
 python-dotenv==1.2.2
 SQLAlchemy==2.0.51
 streamlit[auth]==1.60.0
+openai==3.26.0
+pydantic==2.13.5
