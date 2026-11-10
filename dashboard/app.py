@@ -13,7 +13,7 @@ import streamlit as st
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
-from dashboard.plan_preview import render_ten_k_preview
+
 
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from dashboard.plan_preview import render_ten_k_preview
 from src.database import engine
 
 from src.auth import (
