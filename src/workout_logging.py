@@ -27,6 +27,27 @@ class RunActivityInput:
     notes: str | None = None
 
 
+STANDARD_PR_DISTANCES_M = (5_000, 10_000, 21_097, 42_195)
+RIEGEL_EXPONENT = 1.06
+
+
+def estimate_standard_distance_records(
+    distance_m: int,
+    duration_sec: int,
+) -> dict[int, int]:
+    if distance_m <= 0 or duration_sec <= 0:
+        raise WorkoutLoggingError(
+            "Quãng đường và thời gian phải lớn hơn 0."
+        )
+
+    return {
+        target_m: round(
+            duration_sec * (target_m / distance_m) ** RIEGEL_EXPONENT
+        )
+        for target_m in STANDARD_PR_DISTANCES_M
+    }
+
+
 @dataclass(frozen=True)
 class WellnessInput:
     athlete_id: int
@@ -158,7 +179,17 @@ def save_run_activity(
         },
     ).mappings().one()
 
-    return dict(row)
+    result = dict(row)
+    result["improved_personal_records"] = (
+        update_estimated_personal_records(
+            connection,
+            athlete_id=int(activity.athlete_id),
+            activity_date=activity.activity_date,
+            distance_m=distance_m,
+            duration_sec=duration_sec,
+        )
+    )
+    return result
 
 
 def update_support_session(
@@ -375,3 +406,75 @@ def save_daily_wellness(
     ).mappings().one()
 
     return dict(row)
+
+def update_estimated_personal_records(
+    connection: Connection,
+    *,
+    athlete_id: int,
+    activity_date: date,
+    distance_m: int,
+    duration_sec: int,
+) -> list[dict]:
+    improved = []
+
+    estimates = estimate_standard_distance_records(
+        distance_m,
+        duration_sec,
+    )
+
+    for target_m, estimated_duration_sec in estimates.items():
+        best = connection.execute(
+            text(
+                """
+                SELECT MIN(completed_duration_sec)
+                FROM public.athlete_personal_records
+                WHERE athlete_id = :athlete_id
+                  AND distance_m = :distance_m
+                """
+            ),
+            {
+                "athlete_id": athlete_id,
+                "distance_m": target_m,
+            },
+        ).scalar_one()
+
+        if best is not None and estimated_duration_sec >= int(best):
+            continue
+
+        connection.execute(
+            text(
+                """
+                INSERT INTO public.athlete_personal_records
+                (
+                    athlete_id,
+                    distance_m,
+                    completed_duration_sec,
+                    achieved_date,
+                    record_source
+                )
+                VALUES
+                (
+                    :athlete_id,
+                    :distance_m,
+                    :duration_sec,
+                    :achieved_date,
+                    'ESTIMATED_ACTIVITY'
+                )
+                """
+            ),
+            {
+                "athlete_id": athlete_id,
+                "distance_m": target_m,
+                "duration_sec": estimated_duration_sec,
+                "achieved_date": activity_date,
+            },
+        )
+
+        improved.append(
+            {
+                "distance_m": target_m,
+                "duration_sec": estimated_duration_sec,
+            }
+        )
+
+    return improved

@@ -3,6 +3,7 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 from sqlalchemy import text
+from sqlalchemy.engine import Engine
 
 from src.plan_generator import (
     GeneratedTrainingPlan,
@@ -39,6 +40,162 @@ def load_latest_pr(
         return None
 
     return result.iloc[0].to_dict()
+
+def save_confirmed_plan(
+    engine: Engine,
+    *,
+    athlete_id: int,
+    goal_id: int,
+    plan_name: str,
+    start_date: date,
+    end_date: date,
+    planned_days_per_week: int,
+    plan_level: str,
+    workouts: list,
+    daily_mobility: list,
+) -> int:
+    with engine.begin() as connection:
+        # Cancel overlapping active plans, keeping their history.
+        connection.execute(
+            text(
+                """
+                UPDATE public.training_plans
+                SET status = 'CANCELLED'
+                WHERE athlete_id = :athlete_id
+                  AND status = 'ACTIVE'
+                  AND daterange(start_date, end_date, '[]')
+                      && daterange(:start_date, :end_date, '[]')
+                """
+            ),
+            {
+                "athlete_id": athlete_id,
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+        )
+
+        plan_id = connection.execute(
+            text(
+                """
+                INSERT INTO public.training_plans
+                (
+                    athlete_id,
+                    goal_id,
+                    plan_name,
+                    start_date,
+                    end_date,
+                    planned_days_per_week,
+                    plan_level,
+                    status
+                )
+                VALUES
+                (
+                    :athlete_id,
+                    :goal_id,
+                    :plan_name,
+                    :start_date,
+                    :end_date,
+                    :planned_days_per_week,
+                    :plan_level,
+                    'ACTIVE'
+                )
+                RETURNING plan_id
+                """
+            ),
+            {
+                "athlete_id": athlete_id,
+                "goal_id": goal_id,
+                "plan_name": plan_name,
+                "start_date": start_date,
+                "end_date": end_date,
+                "planned_days_per_week": planned_days_per_week,
+                "plan_level": plan_level,
+            },
+        ).scalar_one()
+
+        connection.execute(
+            text(
+                """
+                INSERT INTO public.planned_workouts
+                (
+                    plan_id,
+                    scheduled_date,
+                    workout_type,
+                    workout_name,
+                    planned_distance_m,
+                    planned_duration_sec,
+                    target_pace_sec_per_km,
+                    notes
+                )
+                VALUES
+                (
+                    :plan_id,
+                    :scheduled_date,
+                    :workout_type,
+                    :workout_name,
+                    :distance_m,
+                    :duration_sec,
+                    :pace,
+                    :notes
+                )
+                """
+            ),
+            [
+                {
+                    "plan_id": plan_id,
+                    "scheduled_date": workout.scheduled_date,
+                    "workout_type": workout.workout_type,
+                    "workout_name": workout.workout_name,
+                    "distance_m": workout.planned_distance_m,
+                    "duration_sec": workout.planned_duration_sec,
+                    "pace": workout.target_pace_sec_per_km,
+                    "notes": workout.notes,
+                }
+                for workout in workouts
+            ],
+        )
+
+        connection.execute(
+            text(
+                """
+                INSERT INTO public.mobility_sessions
+                (
+                    athlete_id,
+                    external_session_id,
+                    session_date,
+                    routine,
+                    completed,
+                    plan_id,
+                    status
+                )
+                VALUES
+                (
+                    :athlete_id,
+                    :external_session_id,
+                    :session_date,
+                    :routine,
+                    FALSE,
+                    :plan_id,
+                    'PLANNED'
+                )
+                """
+            ),
+            [
+                {
+                    "athlete_id": athlete_id,
+                    "external_session_id": (
+                        f"WEBPLAN-{plan_id}-{item.scheduled_date.isoformat()}"
+                    ),
+                    "session_date": item.scheduled_date,
+                    "routine": item.routine,
+                    "plan_id": plan_id,
+                }
+                for item in daily_mobility
+            ],
+        )
+
+    return int(plan_id)
+
 
 def load_mobility_reference_routines(
     read_query,
@@ -108,9 +265,49 @@ def load_mobility_reference_routines(
 
 def render_ten_k_preview(
     read_query,
-    athlete_id: int
+    athlete_id: int,
+    engine: Engine,
 ) -> None:
     st.header("Preview kế hoạch")
+
+    goals = read_query(
+        """
+        SELECT
+            goal_id,
+            goal_name,
+            target_distance_m,
+            target_duration_sec,
+            target_date
+        FROM public.goals
+        WHERE athlete_id = :athlete_id
+          AND status = 'ACTIVE'
+          AND target_distance_m IS NOT NULL
+        ORDER BY priority_level, target_date, goal_id
+        """,
+        {"athlete_id": athlete_id},
+    )
+
+    if goals.empty:
+        st.info("Hãy tạo goal ACTIVE có cự ly trước khi tạo Preview.")
+        return
+
+    goal_labels = {
+        int(row.goal_id):
+            f"{row.goal_name} — {row.target_distance_m / 1000:g} km"
+        for row in goals.itertuples()
+    }
+
+    selected_goal_id = st.selectbox(
+        "Goal dùng cho plan mới",
+        options=list(goal_labels),
+        format_func=lambda goal_id: goal_labels[goal_id],
+    )
+    selected_goal = goals.loc[
+        goals["goal_id"] == selected_goal_id
+    ].iloc[0]
+
+    race_date = pd.Timestamp(selected_goal["target_date"]).date()
+    goal_distance_m = int(selected_goal["target_distance_m"])
 
     latest_pr = load_latest_pr(
         read_query,
@@ -130,11 +327,6 @@ def render_ten_k_preview(
     st.sidebar.header("Thông tin kế hoạch")
 
 
-    race_date = st.sidebar.date_input(
-        "Ngày thi",
-        value=date(2027, 1, 24),
-    )
-
     plan_level = st.sidebar.selectbox(
         "Trình độ",
         ["BEGINNER", "INTERMEDIATE", "ADVANCED"],
@@ -146,16 +338,9 @@ def render_ten_k_preview(
         "ADVANCED": [21_097, 42_195],
     }
 
-    goal_distance_m = st.sidebar.selectbox(
-        "Cự ly mục tiêu",
-        options=allowed_goal_distance[plan_level],
-        format_func=lambda distance: {
-            5_000: "5K",
-            10_000: "10K",
-            21_097: "Half Marathon",
-            42_195: "Marathon",
-        }[distance],
-    )
+    if goal_distance_m not in allowed_goal_distance[plan_level]:
+        st.warning("Cự ly goal không phù hợp với trình độ đã chọn.")
+        return
 
     allowed_runs_per_week = {
         "BEGINNER": [4],
@@ -198,6 +383,11 @@ def render_ten_k_preview(
         plan_level=plan_level,
         rest_weekday=rest_weekday,
         has_injury=has_injury,
+        target_duration_sec=(
+            int(selected_goal["target_duration_sec"])
+            if pd.notna(selected_goal["target_duration_sec"])
+            else None
+        ),    
     )
 
     full_plan_start = (
@@ -228,6 +418,8 @@ def render_ten_k_preview(
             "plan_preview_mobility",
             "plan_preview_athlete_id",
             "plan_preview_input",
+            f"saved_plan_{athlete_id}_{selected_goal_id}",
+            f"confirm_plan_{athlete_id}",
         ):
             st.session_state.pop(key, None)
 
@@ -338,16 +530,40 @@ def render_ten_k_preview(
     st.divider()
     st.subheader("Xác nhận bản Preview")
 
+    save_key = f"saved_plan_{athlete_id}_{selected_goal_id}"
+
     confirmed = st.checkbox(
         "Tôi đã xem và xác nhận bản Preview này",
+        key=f"confirm_plan_{athlete_id}",
     )
 
     if confirmed:
-        st.success(
-            "Preview đã được xác nhận trong phiên hiện tại. "
-            "Chưa ghi dữ liệu vào database."
-        )
+        saved_plan_id = st.session_state.get(save_key)
+
+        if saved_plan_id is not None:
+            st.success(f"Plan #{saved_plan_id} đã được kích hoạt.")
+        elif st.button(
+            "Xác nhận và kích hoạt plan",
+            type="primary",
+            key=f"activate_plan_{athlete_id}_{selected_goal_id}",
+        ):
+            try:
+                plan_id = save_confirmed_plan(
+                    engine,
+                    athlete_id=athlete_id,
+                    goal_id=int(selected_goal_id),
+                    plan_name=f"{selected_goal['goal_name']} — {plan_level}",
+                    start_date=available_start,
+                    end_date=race_date,
+                    planned_days_per_week=runs_per_week,
+                    plan_level=plan_level,
+                    workouts=workouts,
+                    daily_mobility=daily_mobility,
+                )
+            except Exception as error:
+                st.error(f"Không lưu được plan: {error}")
+            else:
+                st.session_state[save_key] = plan_id
+                st.success(f"Đã kích hoạt plan #{plan_id}.")
     else:
-        st.info(
-            "Hãy kiểm tra lịch trước khi xác nhận."
-        )
+        st.info("Hãy kiểm tra lịch trước khi xác nhận.")

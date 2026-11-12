@@ -45,6 +45,7 @@ class TrainingPlanInput:
     plan_level: str
     rest_weekday: int
     has_injury: bool = False
+    target_duration_sec: int | None = None
 
     def validate(self) -> None:
         if self.race_date <= date.today():
@@ -55,6 +56,12 @@ class TrainingPlanInput:
 
         if self.latest_pr_duration_sec <= 0:
             raise ValueError("Latest PR duration must be positive.")
+
+        if (
+            self.target_duration_sec is not None
+            and self.target_duration_sec <= 0
+        ):
+            raise ValueError("Target duration must be positive when provided.")
 
         allowed_distances = {
             "BEGINNER": {5_000, 10_000},
@@ -98,6 +105,8 @@ class TrainingPlanInput:
     @property
     def estimated_goal_duration_sec(self) -> int:
         # Ước lượng tham khảo từ PR; chưa phải dự báo thành tích chính xác.
+        if self.target_duration_sec is not None:
+            return self.target_duration_sec
         return round(
             self.latest_pr_duration_sec
             * (self.goal_distance_m / self.latest_pr_distance_m) ** 1.06

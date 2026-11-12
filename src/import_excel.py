@@ -8,6 +8,7 @@ import pandas as pd
 from sqlalchemy import text
 
 from database import engine
+from workout_logging import update_estimated_personal_records
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -946,6 +947,13 @@ def sync_run_log(
 
             updated += 1
 
+        update_estimated_personal_records(
+            connection,
+            athlete_id=athlete_id,
+            activity_date=parameters["activity_date"],
+            distance_m=distance_m,
+            duration_sec=duration_sec,
+        )
     return inserted, updated
 
 

@@ -234,6 +234,20 @@ def render_run_form(
             ]
         )
 
+        #Tạo PR mới
+        improved_records = result.get("improved_personal_records", [])
+
+        if improved_records:
+            record_summary = ", ".join(
+                f"{record['distance_m'] / 1000:g} km: "
+                f"{record['duration_sec'] // 60} phút "
+                f"{record['duration_sec'] % 60:02d} giây"
+                for record in improved_records
+            )
+            st.info("PR ước tính mới: " + record_summary)
+        else:
+            st.caption("Hoạt động này không tạo PR ước tính mới.")
+
         st.success(
             "Đã lưu hoạt động. "
             f"Trạng thái: "

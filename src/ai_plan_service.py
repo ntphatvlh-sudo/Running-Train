@@ -67,6 +67,7 @@ Hãy tạo lịch trong khoảng từ {start_date.isoformat()}
 
 Trình độ: {plan_input.plan_level}
 Cự ly mục tiêu: {plan_input.goal_distance_m} mét
+Thời gian mục tiêu: {plan_input.target_duration_sec or 'chưa đặt'} giây
 Số ngày chạy mỗi tuần: {plan_input.runs_per_week}
 Ngày nghỉ chính: {rest_day}
 PR gần nhất: {plan_input.latest_pr_distance_m} mét trong
