@@ -26,6 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dashboard.plan_preview import render_ten_k_preview
 from src.database import engine
+from dashboard.goal_management import render_goal_list
 
 from src.auth import (
     AUTHORIZED_STATE,
@@ -814,10 +815,31 @@ else:
 
 current_athlete_id = current_access.athlete_id
 
+with engine.begin() as connection:
+    connection.execute(
+        text(
+            """
+            UPDATE public.training_plans
+            SET status = 'COMPLETED'
+            WHERE athlete_id = :athlete_id
+              AND status = 'ACTIVE'
+              AND end_date < CURRENT_DATE
+            """
+        ),
+        {"athlete_id": int(current_athlete_id)},
+    )
+
+render_goal_list(
+    engine=engine,
+    athlete_id=int(current_athlete_id),
+    can_manage=current_access.access_role in {"RUNNER", "OWNER", "COACH"}
+)
+
 st.divider()
 render_ten_k_preview(
     read_query=read_query,
     athlete_id=int(current_athlete_id),
+    engine=engine,
 )
 
 st.sidebar.caption(
@@ -861,7 +883,8 @@ try:
             plan_id AS "PlanID",
             plan_name AS "PlanName",
             start_date AS "StartDate",
-            end_date AS "EndDate"
+            end_date AS "EndDate",
+            status AS "Status"
         FROM public.training_plans
         WHERE athlete_id = :athlete_id
         ORDER BY start_date
@@ -917,6 +940,99 @@ selected_plan_id = st.sidebar.selectbox(
     key="selected_training_plan",
     format_func=lambda plan_id: plan_names[plan_id],
 )
+
+selected_plan_status = plans.loc[
+    plans["PlanID"] == selected_plan_id,
+    "Status",
+].iloc[0]
+
+if selected_plan_status == "DRAFT":
+    st.sidebar.caption("Plan này hiện đang ở trạng thái DRAFT.")
+
+    if st.sidebar.button(
+        "Kích hoạt plan nháp",
+        key=f"activate_draft_plan_{selected_plan_id}",
+    ):
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        UPDATE public.training_plans
+                        SET status = 'COMPLETED'
+                        WHERE athlete_id = :athlete_id
+                          AND status = 'ACTIVE'
+                          AND end_date < CURRENT_DATE
+                        """
+                    ),
+                    {"athlete_id": int(current_athlete_id)},
+                )
+
+                has_overlap = connection.execute(
+                    text(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM public.training_plans AS active
+                            JOIN public.training_plans AS draft
+                              ON draft.plan_id = :plan_id
+                            WHERE active.athlete_id = :athlete_id
+                              AND active.status = 'ACTIVE'
+                              AND active.plan_id <> draft.plan_id
+                              AND daterange(
+                                    active.start_date,
+                                    active.end_date,
+                                    '[]'
+                                  )
+                                  &&
+                                  daterange(
+                                    draft.start_date,
+                                    draft.end_date,
+                                    '[]'
+                                  )
+                        )
+                        """
+                    ),
+                    {
+                        "athlete_id": int(current_athlete_id),
+                        "plan_id": int(selected_plan_id),
+                    },
+                ).scalar_one()
+
+                if has_overlap:
+                    raise ValueError(
+                        "Plan dates overlap another ACTIVE plan."
+                    )
+
+                result = connection.execute(
+                    text(
+                        """
+                        UPDATE public.training_plans
+                        SET status = 'ACTIVE'
+                        WHERE plan_id = :plan_id
+                          AND athlete_id = :athlete_id
+                          AND status = 'DRAFT'
+                          AND start_date <= CURRENT_DATE
+                          AND end_date >= CURRENT_DATE
+                        """
+                    ),
+                    {
+                        "plan_id": int(selected_plan_id),
+                        "athlete_id": int(current_athlete_id),
+                    },
+                )
+
+                if result.rowcount != 1:
+                    raise ValueError(
+                        "Plan must be DRAFT and include today's date."
+                    )
+
+            st.success("Đã kích hoạt plan.")
+            st.cache_data.clear()
+            st.rerun()
+
+        except (SQLAlchemyError, ValueError) as error:
+            st.error(f"Không kích hoạt được plan: {error}")
 
 st.query_params["plan_id"] = str(selected_plan_id)
 
